@@ -91,6 +91,7 @@ def calculate_rgb_mean_and_std_safe(image_folder_path, target_size=None):
     
     # 标准差 = sqrt( (平方和 / 总像素数) - (均值 * 均值) )
     var_tensor = (sum_sq_per_channel / total_pixels_per_channel) - (mean_tensor ** 2)
+    var_tensor = torch.clamp(var_tensor, min=0.0)  # 避免负值
     std_tensor = torch.sqrt(var_tensor).to(torch.float32)
 
     rgb_mean_list = mean_tensor.tolist()
@@ -105,7 +106,7 @@ image_dir = '/data/truenas_B2/yyi/data/6y_bone_cancer'
 
 # 如果模型要求输入图像大小统一，这里可以设置。否则设置为 None
 # 例如: target_size = (224, 224)
-target_size = None 
+target_size = 512
 
 # 执行计算
 dataset_means, dataset_stds = calculate_rgb_mean_and_std_safe(image_dir, target_size)
