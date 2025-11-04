@@ -898,8 +898,9 @@ def train_multi_task_classifier(logger: logging.Logger, val_split_ratio: float =
                 break
 
     logger.info("\n多任务训练完成！")
+    '''
     if best_epoch > 0:
-        MISCLASSIFIED_OUTPUT_DIR = os.path.join(TENSORBOARD_LOG_DIR, 'misclassified')
+        MISCLASSIFIED_OUTPUT_DIR = os.path.join(LOG_DIR, 'misclassified')
         os.makedirs(MISCLASSIFIED_OUTPUT_DIR , exist_ok=True)
         
         all_errors = []
@@ -929,6 +930,7 @@ def train_multi_task_classifier(logger: logging.Logger, val_split_ratio: float =
             logger.info(f"🎉 最终保存：已将最佳 Epoch ({best_epoch}) 的 {len(all_errors)} 个 (Train+Val) 错误样本记录到 {output_path}")
         else:
              logger.info(f"最佳 Epoch ({best_epoch}) 没有记录到任何错误样本。")
+             '''
     writer.close() # 确保所有数据写入日志文件
     return None
 
