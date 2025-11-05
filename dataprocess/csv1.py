@@ -2,7 +2,7 @@ import os
 import pandas as pd
 
 # 支持的图像扩展名（可根据需要添加）
-IMAGE_EXTENSIONS = {'.npz'}
+IMAGE_EXTENSIONS = {'.dcm'}
 
 def create_image_csv(image_folder, output_csv):
     # 用于保存图像路径的列表
@@ -25,7 +25,7 @@ def create_image_csv(image_folder, output_csv):
 
 # 示例调用
 if __name__ == '__main__':
-    image_folder = '/data/truenas_B2/Dataset/001_6yXray/pretrain_1022'     # 替换为你的图像文件夹路径
-    output_csv = '/home/yyi/data/pretrain_1024.csv'  # 替换为你想保存的CSV路径
+    image_folder = '/data/truenas_B2/Dataset/001_6yXray/bone_cancer'     # 替换为你的图像文件夹路径
+    output_csv = '/home/yyi/data/bone_cancer.csv'  # 替换为你想保存的CSV路径
 
     create_image_csv(image_folder, output_csv)

@@ -298,7 +298,7 @@ if __name__ == "__main__":
     # --- 1. 配置和路径 ---
     pretrained_model_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
     LOCAL_Weights = True
-    local_weights_path = "/data/truenas_B2/yyi/bone_logs_512/eval/manual_34999/teacher_checkpoint.pth"
+    local_weights_path = "/data/truenas_B2/yyi/bone_logs_512/eval/training_79499/teacher_checkpoint.pth"
     IMAGE_PATHS = [
         "/home/yyi/images/images/cat.jpg",
         "/home/yyi/images/images/chest.png",
@@ -310,7 +310,7 @@ if __name__ == "__main__":
         "/home/yyi/images/images/spine.png"
     ]
     IMAGE_SIZE = 1024
-    LOCAL_NAME = "boneDinov3_34999"
+    LOCAL_NAME = "boneDinov3_79499"
     SAVE_DIR = f"/home/yyi/images/pca_image/{LOCAL_NAME}"
     
     # 确保图像路径不是默认的占位符

@@ -2,9 +2,9 @@ import pandas as pd
 import os
 
 # 配置参数
-input_csv = "/home/yyi/data/bonecancer/bonecancer_part.csv"          # 替换为你的输入 CSV 路径
-output_csv = "/home/yyi/data/bonecancer/bonecancer_part_output.csv"        # 输出 CSV 路径
-path_column = "dicom_path"                     # 你的路径列名（根据实际情况修改）
+input_csv = "/home/yyi/data/cancer.csv"          # 替换为你的输入 CSV 路径
+output_csv = "/home/yyi/data/cancer_part_output.csv"        # 输出 CSV 路径
+path_column = "image_path"                     # 你的路径列名（根据实际情况修改）
 
 # 读取 CSV
 df = pd.read_csv(input_csv, encoding='utf-8-sig')  # utf-8-sig 处理可能的 BOM
@@ -16,7 +16,7 @@ def extract_parent_dir(path):
     # 规范化路径并分割
     parts = [p for p in os.path.normpath(path).split(os.sep) if p]
     if len(parts) >= 2:
-        return parts[-2]  # 倒数第二个
+        return parts[-3]  # 倒数第二个
     else:
         return ""  # 路径太短，无法提取
 

@@ -2,8 +2,8 @@ import pandas as pd
 
 # ========== 配置 ==========
 csv_path = "/home/yyi/data/bonecancer/bonecancer_part_output.csv"
-excel_path = "/home/yyi/data/bonecancer/primary_merge_all.xlsx"
-output_success_path = "/home/yyi/data/bonecancer/success_filtered.csv"
+excel_path = "/home/yyi/data/原发转移骨肿瘤汇总带标签.xlsx"
+output_success_path = "/home/yyi/data/bonecancer/all_success.csv"
 output_failed_path = "/home/yyi/data/bonecancer/failed.csv"
 
 barcode_col = "条码号"
