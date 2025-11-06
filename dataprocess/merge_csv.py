@@ -1,8 +1,8 @@
 import pandas as pd
 
-file1 = '/home/yyi/bone_cancer.csv'        # 临床数据
-file2 = '/home/yyi/bone_cancer_png.csv'    # 图像路径数据
-output_file = '/home/yyi/data/bone_cancer_png_path.csv'
+file1 = '/home/yyi/data/MURA_train.csv'        # 临床数据
+file2 = '/home/yyi/data/MURA_val.csv'    # 图像路径数据
+output_file = '/home/yyi/data/MURA.csv'
 
 # 读取
 df1 = pd.read_csv(file1)
