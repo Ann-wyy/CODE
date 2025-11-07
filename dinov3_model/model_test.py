@@ -31,24 +31,24 @@ MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 256
 LEARNING_RATE = 0.1
-NUM_EPOCHS = 1
+NUM_EPOCHS = 100
 PATIENCE = 50 # 早停耐心值
-RANDOM_SEED = 1
+RANDOM_SEED = 1  # 1, 42, 123, 1000, 2025
 
 # 自动选择 GPU 设备，优先使用 cuda:0
-DEVICE = "cuda:1"
+DEVICE = "cuda:4"
 
 # 用户提供的文件路径
 TRAIN_NAME = f"BTXRD"
 CSV_PATH = "/home/yyi/data/test_dataset/BTXRD_dataset.csv" # 标签CSV文件路径
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
-LABEL_COLUMNS = ['tumor','benign','malignant'] # 您的所有标签列名
-LOAD_LOCAL_CHECKPOINT = False
+LABEL_COLUMNS = ['tumor','benign','malignant']  # 您的所有标签列名
+LOAD_LOCAL_CHECKPOINT = True
 if LOAD_LOCAL_CHECKPOINT:
     TEST_NAME = "boneDinov3"
 else:
     TEST_NAME = "Dinov3"
-TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
+TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}_1"
 LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_92999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 
 # **新增：日志配置函数**
@@ -65,7 +65,6 @@ def setup_logging():
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(LOG_FILENAME), # 写入文件
             logging.StreamHandler() # 输出到控制台
@@ -177,20 +176,22 @@ class DinoV3MultiTaskClassifier(nn.Module):
                 else:
                     state_dict = checkpoint
                     print("🔑 Checkpoint is flat. Using top-level state dict.")
-                    state_dict = convert_dinov3_teacher_to_hf_state_dict(
-                            state_dict, 
-                            model_dim=1024 
-                        )
+                
+                # 转换键名以匹配 Hugging Face 模型
+                state_dict = convert_dinov3_teacher_to_hf_state_dict(
+                        state_dict, 
+                        model_dim=1024
+                )
 
                 try:
                     # 使用 strict=False 允许忽略不需要的键（如分类头或注册token）
                     load_info = self.backbone.load_state_dict(state_dict, strict=False)
-                    print("Local Teacher weights loaded successfully.")
+                    logger.info("Local Teacher weights loaded successfully.")
                     # 打印缺失和不匹配的键，用于调试
                     if load_info.unexpected_keys:
-                        print(f"⚠️ Warning: Unexpected keys (ignored): {load_info.unexpected_keys[:5]}...")
+                        logger.warning(f"⚠️ Warning: Unexpected keys (ignored): {load_info.unexpected_keys[:5]}...")
                     if load_info.missing_keys:
-                        print(f"⚠️ Warning: Missing keys (using HF weights): {load_info.missing_keys[:5]}...")
+                        logger.warning(f"⚠️ Warning: Missing keys (using HF weights): {load_info.missing_keys[:5]}...")
                     logger.info("✅ Backbone checkpoint loaded successfully.")
 
                 except Exception as e:
@@ -245,6 +246,11 @@ class DinoV3MultiTaskClassifier(nn.Module):
 def train_multi_task_classifier(logger: logging.Logger):
     # 1. 初始化预处理器
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+    if LOAD_LOCAL_CHECKPOINT:
+        processor.image_mean = [0.351, 0.35, 0.351]
+        processor.image_std = [0.297, 0.298, 0.298]
+        logger.info(f"图像处理参数已修改: Mean={processor.image_mean}, Std={processor.image_std}")
+
     # --- TENSORBOARD 初始化 ---
     writer = SummaryWriter(log_dir=LOG_DIR)
     logger.info(f"TensorBoard Writer initialized at: {LOG_DIR}")
@@ -365,6 +371,14 @@ def train_multi_task_classifier(logger: logging.Logger):
 
     # 初始化 GradScaler
     scaler = torch.amp.GradScaler('cuda')
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max',                 # 监控分数，所以使用 'max'
+        factor=0.1,                 # 每次降低为原来的 1/10
+        patience=5, # 多少个 epoch 不改善后触发
+        min_lr=1e-6             # 学习率下限
+    )
+    logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 5")
 
     logger.info(f"模型已加载，在设备 {DEVICE} 上训练...")
 
@@ -470,6 +484,10 @@ def train_multi_task_classifier(logger: logging.Logger):
         # --- 早停和模型保存逻辑更新 ---
         key_task = task_names[0]
         val_score = val_metrics[key_task].get('auprc', val_metrics[key_task].get('auroc', 0.0))
+        # === 新增：学习率调度器步进 ===
+        scheduler.step(val_score) 
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"当前学习率 (LR): {current_lr:.6f}")
         if val_score > best_val_score:
             best_val_score = val_score
             patience_counter = 0
@@ -514,12 +532,12 @@ def train_multi_task_classifier(logger: logging.Logger):
         model, test_loader, criterion_dict, model.task_names, num_classes_dict, DEVICE, mode='test', logger=logger
     )
     log_metrics_to_tensorboard(
-        writer, 
-        test_metrics, 
-        epoch + 1, 
-        'Test', 
-        logger,
-    )
+            writer, 
+            val_metrics, 
+            epoch + 1, 
+            'Test', 
+            logger
+        )
     writer.close() # 确保所有数据写入日志文件
     return None
 

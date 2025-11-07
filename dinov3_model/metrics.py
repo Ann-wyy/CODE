@@ -184,18 +184,18 @@ def log_metrics_to_tensorboard(
             if not np.isnan(val):
                 writer.add_scalar(f'{stage}_Summary/{key.upper()}_{task_name}', val, step)
                 all_individual_metrics[key].append(val)
-                if key in ['auroc', 'auprc', 'accuracy']:
-                    # 标签：Stage/Task_Aggregated/Metric
-                    writer.add_scalar(
-                        f'{stage}_Aggregated/{task_name}_Comparison', 
-                        val, 
-                        step
-                    )
-        for key, val_list in all_individual_metrics.items():
-            if val_list:
-                avg_val = np.mean(val_list)
-                
-        # 写入 BOARD (Avg_METRIC 标签)
-        writer.add_scalar(f'{stage}_Summary/Avg_{key.upper()}', avg_val, step)
+    
+    average_metrics = {}
+    for key in ['auroc', 'auprc', 'accuracy']:
+        values = all_individual_metrics[key]
+        if values:
+            avg_val = np.mean(values)
+            average_metrics[key] = avg_val
+            writer.add_scalar(f'{stage}_Aggregated/AVERAGE_{key.upper()}', avg_val, step)
+            logger.info(f"Average {key.upper()}: {avg_val:.4f}")
+        else:
+            logger.warning(f"No valid {key.upper()} values found for averaging.")
+            average_metrics[key] = float('nan')
+    
 
     

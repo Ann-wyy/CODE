@@ -131,27 +131,23 @@ def convert_dinov3_teacher_to_hf_state_dict(
             k = k.replace('.mlp.fc1.', '.mlp.up_proj.')
         if '.mlp.fc2.' in k:
             k = k.replace('.mlp.fc2.', '.mlp.down_proj.')
-            
-        # 3.4. Layer Scale 核心修正 (针对缺失的 lambdaX)
-        # 原始 DINOv3 通常是 ls1/ls2 或 ls1.weight/ls2.weight
-        # HF ViT 期望: layer_scale1.lambda1 / layer_scale2.lambda2
         
         # 修正 ls1 -> layer_scale1.lambda1
         if '.ls1' in k:
             # 移除 ls1 的可能后缀 (如 .weight)
             k_base = k.replace('.ls1.weight', '.ls1').replace('.ls1', '.layer_scale1.lambda1')
-            k = k_base
+            k_base = k_base.replace('.gamma', '')
+            if k_base != k:
+                k = k_base
             
         # 修正 ls2 -> layer_scale2.lambda2
         if '.ls2' in k:
             # 移除 ls2 的可能后缀 (如 .weight)
             k_base = k.replace('.ls2.weight', '.ls2').replace('.ls2', '.layer_scale2.lambda1') # 注意：HF 可能是 lambda1
-            k = k_base
+            k_base = k_base.replace('.gamma', '')
+            if k_base != k:
+                k = k_base
 
-        # 3.5. 修复 Layer Norm 命名 (如果存在差异)
-        # DINOv3: norm1/norm2
-        # HF ViT: layernorm_before/layernorm_after
-        # ViT 大多使用 norm1/norm2，这里主要确保它们没有被错误地当成 Layer Scale
         
         # 如果键没有被 QKV 逻辑跳过，则将其添加到重命名字典中
         state_dict_renamed[k] = v
