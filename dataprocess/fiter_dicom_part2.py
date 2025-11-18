@@ -16,7 +16,7 @@ def extract_parent_dir(path):
     # 规范化路径并分割
     parts = [p for p in os.path.normpath(path).split(os.sep) if p]
     if len(parts) >= 2:
-        return parts[-3]  # 倒数第二个
+        return parts[-3]  # 倒数第几
     else:
         return ""  # 路径太短，无法提取
 

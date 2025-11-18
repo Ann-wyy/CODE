@@ -32,24 +32,24 @@ TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 256
 LEARNING_RATE = 0.1
 NUM_EPOCHS = 100
-PATIENCE = 50 # 早停耐心值
-RANDOM_SEED = 1  # 1, 42, 123, 1000, 2025
+PATIENCE = 30 # 早停耐心值
+RANDOM_SEED = 42 # 42, 100, 600, 1000, 2025
 
 # 自动选择 GPU 设备，优先使用 cuda:0
-DEVICE = "cuda:4"
+DEVICE = "cuda:7"
 
 # 用户提供的文件路径
-TRAIN_NAME = f"BTXRD"
-CSV_PATH = "/home/yyi/data/test_dataset/BTXRD_dataset.csv" # 标签CSV文件路径
+TRAIN_NAME = f"FracAtlas"
+CSV_PATH = "/home/yyi/data/test_dataset/FracAtlas_dataset.csv" # 标签CSV文件路径
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
-LABEL_COLUMNS = ['tumor','benign','malignant']  # 您的所有标签列名
-LOAD_LOCAL_CHECKPOINT = True
+LABEL_COLUMNS = ['Fractured']  # 您的所有标签列名
+LOAD_LOCAL_CHECKPOINT = True # 是否加载本地检查点
 if LOAD_LOCAL_CHECKPOINT:
     TEST_NAME = "boneDinov3"
 else:
     TEST_NAME = "Dinov3"
-TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}_1"
-LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_92999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
+TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
+LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_91499/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 
 # **新增：日志配置函数**
 LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
@@ -73,6 +73,7 @@ def setup_logging():
     return logging.getLogger(__name__)
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 logger = setup_logging() # 初始化全局日志记录器
+logger.info(f"随机种子: {RANDOM_SEED}")
 
 
 # --- 自定义 PyTorch Dataset (处理多列分类标签) ---
@@ -250,7 +251,6 @@ def train_multi_task_classifier(logger: logging.Logger):
         processor.image_mean = [0.351, 0.35, 0.351]
         processor.image_std = [0.297, 0.298, 0.298]
         logger.info(f"图像处理参数已修改: Mean={processor.image_mean}, Std={processor.image_std}")
-
     # --- TENSORBOARD 初始化 ---
     writer = SummaryWriter(log_dir=LOG_DIR)
     logger.info(f"TensorBoard Writer initialized at: {LOG_DIR}")
@@ -290,6 +290,31 @@ def train_multi_task_classifier(logger: logging.Logger):
         label_encoders[col] = le
         num_classes_dict[col] = len(le.classes_)
         logger.info(f"任务 '{col}': 类别 {list(le.classes_)} → 编码 [0..{len(le.classes_)-1}], 共 {len(le.classes_)} 类")
+
+        if num_classes_dict[col] == 2:
+            # 1. 找出当前编码下的类别频率
+            encoded_labels = train_df[col].loc[train_df[col] != -1]
+            counts = encoded_labels.value_counts()
+            
+            # 假设只有 0 和 1 两种编码
+            if len(counts) == 2:
+                # 找出少数类在当前编码下的值 (0 或 1)
+                minority_encoded_value = counts.idxmin() # 频率最小的编码值
+                
+                # 如果少数类的编码值不是 1，则需要反转 0 和 1
+                if minority_encoded_value == 0:
+                    logger.warning(f"任务 '{col}' 的少数类被编码为 0。正在反转标签 0 <-> 1...")
+                    
+                    # 定义映射规则：0 -> 1, 1 -> 0
+                    mapping = {0: 1, 1: 0}
+                    
+                    # 对所有数据集应用映射
+                    for df in [train_df, val_df, test_df]:
+                        # 只对 0 和 1 进行映射，-1 保持不变
+                        df[col] = df[col].replace(mapping)
+                
+                else:
+                    logger.info(f"任务 '{col}' 的少数类已被正确编码为 1。无需反转。")
     
     def create_dataset(df, is_train=False):
         return MultiTaskImageDatasetFromDataFrame(
@@ -353,6 +378,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             if w_neg > 0:
                 # pos_weight 必须是标量，表示正类的权重
                 pos_weight_scalar = torch.tensor(w_pos / w_neg, dtype=torch.float32, device=DEVICE)
+                logger.info(f"任务 '{task}' 的 BCEWithLogitsLoss 使用 pos_weight={pos_weight_scalar.item():.4f}")
             else:
                 # 如果负类权重为零 (极少数情况)，则使用默认值 1.0 或 w_pos
                 pos_weight_scalar = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
@@ -361,6 +387,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             
         elif num_cls > 2:
             criterion_dict[task] = nn.CrossEntropyLoss(weight=weight)
+            logger.info(f"任务 '{task}' 的 CrossEntropyLoss 使用 class weights: {weight.cpu().numpy()}")
             
         else:
             logger.error(f"任务 '{task}' 的类别数 {num_cls} 无效。使用默认 BCEWithLogitsLoss。")
@@ -374,11 +401,11 @@ def train_multi_task_classifier(logger: logging.Logger):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='max',                 # 监控分数，所以使用 'max'
-        factor=0.1,                 # 每次降低为原来的 1/10
-        patience=5, # 多少个 epoch 不改善后触发
-        min_lr=1e-6             # 学习率下限
+        factor=0.5,                 # 每次降低为原来的 1/2
+        patience=10,               # 多少个 epoch 不改善后触发
+        min_lr=1e-4             # 学习率下限
     )
-    logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 5")
+    logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 10")
 
     logger.info(f"模型已加载，在设备 {DEVICE} 上训练...")
 
@@ -480,14 +507,12 @@ def train_multi_task_classifier(logger: logging.Logger):
             'Val', 
             logger
         )
-        
-        # --- 早停和模型保存逻辑更新 ---
-        key_task = task_names[0]
-        val_score = val_metrics[key_task].get('auprc', val_metrics[key_task].get('auroc', 0.0))
+        key_task = model.task_names[0]
+        val_score = val_metrics[key_task]['auprc']
         # === 新增：学习率调度器步进 ===
         scheduler.step(val_score) 
         current_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"当前学习率 (LR): {current_lr:.6f}")
+        logger.info(f"当前学习率 (LR): {current_lr:.4f}")
         if val_score > best_val_score:
             best_val_score = val_score
             patience_counter = 0

@@ -57,10 +57,10 @@ def calculate_metrics(
         else:
             auroc = roc_auc_score(all_labels, all_probs, multi_class='ovr')
             auprc = average_precision_score(all_labels, all_probs, average='macro')  # 或 'weighted'
-        metrics['auroc'] = float(auroc)
         metrics['auprc'] = float(auprc)
-        logger.info(f"整体 AUROC: {metrics['auroc'] * 100:.2f}%")
+        metrics['auroc'] = float(auroc)
         logger.info(f"整体 AUPRC: {metrics['auprc'] * 100:.2f}%")
+        logger.info(f"整体 AUROC: {metrics['auroc'] * 100:.2f}%")
     except Exception as e:
         logger.warning(f"计算 AUROC/AUPRC 失败 ({task_name}, {mode}): {e}")
         metrics['auroc'] = 0.0
@@ -186,7 +186,7 @@ def log_metrics_to_tensorboard(
                 all_individual_metrics[key].append(val)
     
     average_metrics = {}
-    for key in ['auroc', 'auprc', 'accuracy']:
+    for key in [ 'auprc','auroc', 'accuracy']:
         values = all_individual_metrics[key]
         if values:
             avg_val = np.mean(values)
