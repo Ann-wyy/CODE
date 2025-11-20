@@ -2,26 +2,29 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 # ==================== 配置 ====================
-input_csv = '/home/yyi/data/bone_cancer_png_path.csv'
-output_train = 'bone_cancer_train.csv'
-output_val = 'bone_cancer_val.csv'
+input_csv = '/home/yyi/data/data_pretrain/bone_cancer.csv'
+output_train = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_train.csv'
+output_val = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_val.csv'
+output_test = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_test.csv'  # ← 新增
+
+train_ratio = 0.6
 val_ratio = 0.2
+test_ratio = 0.2
 random_state = 42
 
 # 是否启用分层划分？
 use_stratify = True
 
 # 指定用于分层的列（必须是标签列之一）
-stratify_column = '良恶性'  # ← 只用于分层，但不会影响保存哪些列
+stratify_column = '原发/转移'  # ← 只用于分层，但不会影响保存哪些列
+patient_id_col = '影像号'
 
 # 所有你想保存的列（包括图像路径 + 所有标签列）
 # 格式：{'原始列名': '输出列名'}
 output_columns = {
-    'PNG路径': 'image_path',
-    '条码号': 'barcode',
-    '病理结果': '病理结果',
-    '良恶性': '良恶性',
-    # 可继续添加其他标签列...
+    'image_path': 'image_path',
+    '原发/转移': '原发/转移',
+    '原发良性1/中间型2/恶性3': '良恶性',
 }
 
 # ==================================================
@@ -30,7 +33,7 @@ output_columns = {
 df = pd.read_csv(input_csv, encoding='utf-8-sig')
 
 # 必需的基础列
-required_cols = ['PNG路径', 'PatientID']
+required_cols = ['image_path', '影像号']
 if not all(col in df.columns for col in required_cols):
     raise ValueError(f"CSV 必须包含列: {required_cols}")
 
@@ -47,12 +50,12 @@ if use_stratify:
         print(f"⚠️ 警告：分层列 '{stratify_column}' 不在 output_columns 中，但仍可用于分层。")
 
 print(f"📊 总图像数: {len(df)}")
-print(f"👥 总病人数: {df['PatientID'].nunique()}")
+print(f"👥 总病人数: {df[patient_id_col].nunique()}")
 
 # 2. 按病人分层划分
 if use_stratify:
     # 为每个病人确定一个分层标签（取众数）
-    patient_stratify_map = df.groupby('PatientID')[stratify_column].agg(
+    patient_stratify_map = df.groupby(patient_id_col )[stratify_column].agg(
         lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]
     )
     all_patients = patient_stratify_map.index.tolist()
@@ -62,60 +65,86 @@ if use_stratify:
     print(pd.Series(all_stratify_labels).value_counts())
 
     try:
-        train_patients, val_patients = train_test_split(
+        # 第一次划分：80% (train+val) vs 20% (test)
+        trainval_patients, test_patients = train_test_split(
             all_patients,
-            test_size=val_ratio,
+            test_size=test_ratio,
             stratify=all_stratify_labels,
+            random_state=random_state
+        )
+        # 从 trainval 中再划分 train (60%) 和 val (20%)
+        train_stratify = [patient_stratify_map[p] for p in trainval_patients]
+        train_patients, val_patients = train_test_split(
+            trainval_patients,
+            test_size=val_ratio / (train_ratio + val_ratio),  # 即 0.2 / 0.8 = 0.25
+            stratify=train_stratify,
             random_state=random_state
         )
     except ValueError as e:
         print("⚠️ 分层划分失败（类别太少或不平衡），回退到随机划分")
-        train_patients, val_patients = train_test_split(
+        trainval_patients, test_patients = train_test_split(
             all_patients,
-            test_size=val_ratio,
+            test_size=test_ratio,
+            random_state=random_state
+        )
+        train_patients, val_patients = train_test_split(
+            trainval_patients,
+            test_size=val_ratio / (train_ratio + val_ratio),
             random_state=random_state
         )
 else:
-    unique_patients = df['PatientID'].unique()
-    train_patients, val_patients = train_test_split(
+    unique_patients = df[patient_id_col].unique()
+    trainval_patients, test_patients = train_test_split(
         unique_patients,
-        test_size=val_ratio,
+        test_size=test_ratio,
+        random_state=random_state
+    )
+    train_patients, val_patients = train_test_split(
+        trainval_patients,
+        test_size=val_ratio / (train_ratio + val_ratio),
         random_state=random_state
     )
 
 # 3. 划分图像
 train_pids = set(train_patients)
 val_pids = set(val_patients)
+test_pids = set(test_patients)
 
 def assign_split(pid):
     if pid in train_pids:
         return 'train'
     elif pid in val_pids:
         return 'val'
+    elif pid in test_pids:
+        return 'test'
     else:
         return 'ignore'
 
-df['split'] = df['PatientID'].apply(assign_split)
+df['split'] = df[patient_id_col].apply(assign_split)
 
 # 4. 拆分数据
 train_df = df[df['split'] == 'train'].copy()
 val_df = df[df['split'] == 'val'].copy()
+test_df = df[df['split'] == 'test'].copy()
 
-# 5. 选择并重命名列（保留所有 output_columns 指定的列）
+# 5. 选择并重命名列
 def apply_column_mapping(df_subset):
     return df_subset[list(output_columns.keys())].rename(columns=output_columns)
 
 train_final = apply_column_mapping(train_df)
 val_final = apply_column_mapping(val_df)
+test_final = apply_column_mapping(test_df)
 
 # 6. 保存
 train_final.to_csv(output_train, index=False, encoding='utf-8-sig')
 val_final.to_csv(output_val, index=False, encoding='utf-8-sig')
+test_final.to_csv(output_test, index=False, encoding='utf-8-sig')
 
 # 7. 输出统计
 print(f"\n✅ 划分完成！")
 print(f"📁 训练集: {len(train_final)} 张图像 | {len(train_pids)} 位病人 → {output_train}")
 print(f"📁 验证集: {len(val_final)} 张图像 | {len(val_pids)} 位病人 → {output_val}")
+print(f"📁 测试集: {len(test_final)} 张图像 | {len(test_pids)} 位病人 → {output_test}")
 
 # 如果分层列被保存了，打印其分布
 if use_stratify and stratify_column in output_columns:
@@ -124,3 +153,5 @@ if use_stratify and stratify_column in output_columns:
     print(train_final[out_name].value_counts().sort_index())
     print(f"\n📊 验证集 '{out_name}' 分布:")
     print(val_final[out_name].value_counts().sort_index())
+    print(f"\n📊 测试集 '{out_name}' 分布:")
+    print(test_final[out_name].value_counts().sort_index())

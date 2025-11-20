@@ -37,10 +37,20 @@ def calculate_metrics(
     all_preds = np.argmax(all_probs, axis=1)
 
     metrics = {}
-    metrics['accuracy'] = float(accuracy_score(all_labels, all_preds))
-    metrics['precision'] = float(precision_score(all_labels, all_preds, average='macro', zero_division=0))
-    metrics['recall'] = float(recall_score(all_labels, all_preds, average='macro', zero_division=0))
-    metrics['f1'] = float(f1_score(all_labels, all_preds, average='macro', zero_division=0))
+    valid_indices = (all_labels >= 0)
+    
+    # 过滤数据
+    valid_labels = all_labels[valid_indices]
+    valid_preds = all_preds[valid_indices]
+    valid_probs = all_probs[valid_indices]
+    if len(valid_labels) == 0:
+        logger.warning(f"任务 {task_name} 中没有有效标签 (>=0) 的样本，跳过指标计算。")
+        return {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'auroc': 0.0, 'auprc': 0.0}
+    metrics['accuracy'] = float(accuracy_score(valid_labels, valid_preds))
+    target_names = list(range(num_classes))
+    metrics['precision'] = float(precision_score(valid_labels, valid_preds, labels=target_names,average='macro', zero_division=0))
+    metrics['recall'] = float(recall_score(valid_labels, valid_preds, labels=target_names,average='macro', zero_division=0))
+    metrics['f1'] = float(f1_score(valid_labels, valid_preds, labels=target_names,average='macro', zero_division=0))
 
     logger.info(f"--- {mode.upper()} 结果 (类别数: {num_classes}) ---")
     logger.info(f"整体准确率 (Accuracy): {metrics['accuracy'] * 100:.2f}%")
@@ -51,12 +61,16 @@ def calculate_metrics(
     # --- AUROC ---
     try:
         if num_classes == 2:
+            if len(np.unique(valid_labels)) < 2:
+                raise ValueError("有效二分类样本只含有一个类别。")
             # 二分类：用正类概率
-            auroc = roc_auc_score(all_labels, all_probs[:, 1])
-            auprc = average_precision_score(all_labels, all_probs[:, 1])
+            auroc = roc_auc_score(valid_labels, valid_probs[:, 1]) # 使用过滤后的数据
+            auprc = average_precision_score(valid_labels, valid_probs[:, 1])
         else:
-            auroc = roc_auc_score(all_labels, all_probs, multi_class='ovr')
-            auprc = average_precision_score(all_labels, all_probs, average='macro')  # 或 'weighted'
+            classes = list(range(num_classes))
+            y_true_bin = label_binarize(valid_labels, classes=classes)
+            auroc = roc_auc_score(y_true_bin, valid_probs, multi_class='ovr')
+            auprc = average_precision_score(y_true_bin, valid_probs, average='macro')
         metrics['auprc'] = float(auprc)
         metrics['auroc'] = float(auroc)
         logger.info(f"整体 AUPRC: {metrics['auprc'] * 100:.2f}%")
@@ -95,29 +109,40 @@ def evaluate(model, data_loader, criterion_dict, task_names, num_classes_dict, d
                 predictions = predictions_dict[task_name]
                 num_cls = num_classes_dict.get(task_name)
                 task_criterion = criterion_dict[task_name]
+
+                valid_mask = (labels != -1)
+                valid_count = valid_mask.sum()
                 
-                # 计算损失
-                if num_cls and num_cls > 2:
-                    # 多分类任务
-                    target = labels.long()
-                    probabilities = torch.softmax(predictions, dim=1)
-                else:
-                    # --- 二分类：BCEWithLogitsLoss ---
-                    target = labels.float().view(-1, 1) 
-                    probs_pos = torch.sigmoid(predictions).squeeze(1)
-                    probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) # 形状 [N, 2]
-                task_criterion = criterion_dict[task_name] # 建议为每个任务使用正确的 criterion
-                task_loss = task_criterion(predictions, target)
+                task_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+                if valid_count > 0:
+                    valid_labels = labels[valid_mask]
+                    valid_predictions = predictions[valid_mask]
+
+                    if num_cls and num_cls > 2:
+                        # 多分类任务
+                        target = valid_labels.long() 
+                        # 计算损失 (使用过滤后的标签和预测)
+                        task_loss = task_criterion(valid_predictions, target)
+                        
+                    else:
+                        # --- 二分类：BCEWithLogitsLoss ---
+                        target = valid_labels.float().view(-1, 1)
+                        # 计算损失 (使用过滤后的标签和预测)
+                        task_loss = task_criterion(valid_predictions, target)
                 combined_loss += task_loss
                 
-                # 累加损失和样本数
-                task_counts[task_name] += batch_size
-                
-                # 收集预测和标签
-                # 对于 CrossEntropyLoss，预测是 argmax
+                if num_cls and num_cls > 2:
+                    probabilities = torch.softmax(predictions, dim=1)
+                else:
+                    probs_pos = torch.sigmoid(predictions).squeeze(1)
+                    # 形状 [N, 2]
+                    probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1)
+
                 task_probs[task_name].extend(probabilities.cpu().tolist())
-                preds = (predictions.squeeze(1) > 0).long()
+                # 注意：这里收集的 labels 仍然包含 -1，后续由 calculate_metrics 函数处理过滤
                 task_labels[task_name].extend(labels.cpu().tolist())
+                
             total_combined_loss += combined_loss.item()
 
 

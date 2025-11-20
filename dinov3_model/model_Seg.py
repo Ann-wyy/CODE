@@ -1,35 +1,31 @@
+import sys
+import os
+# 替换为你的 DINOv3 仓库路径
+REPO_DIR = "/data/dataserver01/zhangruipeng/code/PETCT/dinov3_pretrain/dinov3 "  # ⚠️ 请确保已 clone facebookresearch/dinov3
+sys.path.append(REPO_DIR)
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from transformers import AutoImageProcessor, AutoModel
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-import os
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
-from typing import Dict, List, Tuple, Optional, Any
-import numpy as np
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, average_precision_score
-)
-from sklearn.preprocessing import label_binarize
-from torch.utils.data import default_collate
+import torchvision.transforms.v2 as v2  # 官方使用 v2
 import logging
 import time
 from torch.utils.tensorboard import SummaryWriter
-import torchvision.transforms as T
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection import train_test_split
+import numpy as np
 from torchmetrics.classification import MulticlassJaccardIndex
 from torchmetrics.functional import accuracy
+from transformers import AutoImageProcessor, AutoModel
+from typing import Dict, List, Tuple, Optional, Any
+from dinov3 import vision_transformer as vit
+from dinov3.models import build_model
 
 # ================================导入工具函数====================================
 from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
-from metrics import log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
-MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+# MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 4
 LEARNING_RATE = 0.1
@@ -103,20 +99,22 @@ def get_image_mask_pairs(image_dir: str, mask_dir: str, logger: logging.Logger):
 # --- 自定义 PyTorch Dataset (处理多列分类标签) ---
 # --- 1. 分割 PyTorch Dataset ---
 class SegmentationDataset(Dataset):
-    def __init__(self,image_mask_pairs: List[Tuple[str, str]],processor: AutoImageProcessor,
-        size: int,is_training: bool = False, logger: Optional[logging.Logger] = None
-    ):
-        self.pairs = image_mask_pairs
-        self.processor = processor
+    def __init__(self, pairs: List[Tuple[str, str]], size: int, is_train: bool = False):
+        self.pairs = pairs
         self.size = size
-        self.is_training = is_training
-        self.logger = logger
-        
-        # 定义一个只用于 Mask 的 Resize/ToTensor 变换
-        self.mask_transform = T.Compose([
-            T.Resize((size, size), interpolation=T.InterpolationMode.NEAREST), # Mask 必须使用 NEAREST 插值
-            T.ToTensor(), # 将 PIL Image 转换为 [1, H, W] 的 Long Tensor
+        # 官方使用的 transform
+        self.transform = v2.Compose([
+            v2.ToImage(),
+            v2.Resize((size, size), antialias=True),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+        self.mask_transform = v2.Compose([
+            v2.ToImage(),
+            v2.Resize((size, size), interpolation=v2.InterpolationMode.NEAREST),
+            v2.ToDtype(torch.long, scale=False)
+        ])
+
         
 
     def __len__(self):
@@ -124,40 +122,17 @@ class SegmentationDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, mask_path = self.pairs[idx]
-        try:
-            image = Image.open(img_path).convert("RGB")
-            mask = Image.open(mask_path).convert("L") # 灰度图模式打开
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Error loading image/mask at index {idx}: {e}")
-            return None  # 返回 None 以便在 collate_fn 中处理   
-        
-        # 图像预处理
-        resize_transform = T.Resize((self.size, self.size))
-        image = resize_transform(image)
-        mask = resize_transform(mask)
-
-        inputs = self.processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].squeeze(0)  # [C, H, W]
-        mask_tensor = T.ToTensor()(mask).squeeze(0).long() 
-        return pixel_values, mask_tensor, img_path
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        image = self.transform(image)      # [3, H, W]
+        mask = self.mask_transform(mask)   # [1, H, W]
+        return image, mask.squeeze(0), img_path  # mask: [H, W]
 
 # --- 2. Collate Function 修改 ---
 # 分割 Mask 的尺寸通常是相同的 (TARGET_IMAGE_SIZE x TARGET_IMAGE_SIZE)
-def custom_segmentation_collate_fn(batch: List[Any]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    # 过滤掉加载失败的项
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return None, None, None # 返回 None 处理空批次
-
-    pixel_values = torch.stack([item[0] for item in batch]) # [N, C, H, W]
-    
-    # 分割 Mask
-    # item[1] 是 [H, W] 的 Long Tensor
-    segmentation_masks = torch.stack([item[1] for item in batch]) # [N, H, W]
-
-    img_paths = [item[2] for item in batch]
-    return pixel_values, segmentation_masks, img_paths
+def custom_segmentation_collate_fn(batch):
+    images, masks, paths = zip(*batch)
+    return torch.stack(images), torch.stack(masks), list(paths)
 
 # --- 自定义模型：DINOv3 + 多个分类头 ---
 
@@ -174,6 +149,20 @@ class DinoV3SegmentationModel(nn.Module):
 
         # ==================== 根据全局变量加载本地检查点 ====================
         global LOAD_LOCAL_CHECKPOINT, LOCAL_CHECKPOINT_PATH
+
+        self.backbone = build_model(
+            model_name=backbone_name, 
+            pretrained_weights=None, # 先不加载权重，后面手动加载本地检查点
+            out_dim=None, # 如果是分割任务，不需要分类头
+            img_size=size,
+            patch_size=16 # DINOv3 默认
+        )
+        # 确保 backbone 是 nn.Module
+        if isinstance(self.backbone, nn.Module):
+            logger.info(f"✅ DINOv3 official backbone ({backbone_name}) loaded.")
+        else:
+            logger.error("❌ Failed to load DINOv3 official backbone as nn.Module.")
+            sys.exit(1)
 
         if LOAD_LOCAL_CHECKPOINT:
             if os.path.exists(LOCAL_CHECKPOINT_PATH):
@@ -232,8 +221,7 @@ class DinoV3SegmentationModel(nn.Module):
              param.requires_grad = True
         
 
-        
-    def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # 运行主干网络（冻结）
         pixel_values = pixel_values.to(self.input_device)
         
@@ -241,21 +229,15 @@ class DinoV3SegmentationModel(nn.Module):
         with torch.no_grad():
             outputs = self.backbone(pixel_values=pixel_values)
 
-        patch_tokens = outputs.last_hidden_state[:, 1:, :] # (Batch, Num_Tokens, Feature_Dim)
+        with torch.no_grad():
+            features = self.backbone.forward_features(x)
+            # features["x_norm_patchtokens"]: [B, N_patches, C]
+            patch_tokens = features["x_norm_patchtokens"]  # ✅ 官方 API，已排除 registers!
 
-        # 2. 重塑为特征图
-        # Num_Tokens = (H/P)^2
-        num_patches_per_side = int(patch_tokens.size(1)**0.5)
-        
-        # (Batch, Feature_Dim, H/P, W/P)
-        feature_map = patch_tokens.permute(0, 2, 1).reshape(
-            -1, self.backbone.config.hidden_size, num_patches_per_side, num_patches_per_side
-        )
-
-        # 3. 运行解码器
-        logits = self.decoder(feature_map) # (Batch, Num_Classes, H, W)
-
-        return logits
+        B, N, C = patch_tokens.shape
+        h = w = int(N ** 0.5)
+        feature_map = patch_tokens.permute(0, 2, 1).reshape(B, C, h, w)
+        return self.decode_head(feature_map)
 
 def calculate_segmentation_metrics(pred_masks, true_masks, num_classes, logger):
     """
@@ -283,15 +265,11 @@ def calculate_segmentation_metrics(pred_masks, true_masks, num_classes, logger):
 
 # --- 训练函数 (新增日志和早停逻辑) ---
 def train_multi_task_segmentation(logger: logging.Logger):
-    # 1. 初始化预处理器
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME,do_resize=False)
     writer = SummaryWriter(log_dir=LOG_DIR)
     # --- TENSORBOARD 初始化 ---
     logger.info(f"TensorBoard Writer initialized at: {LOG_DIR}")
     best_model_path = os.path.join(LOG_DIR, "best_model.pth")
 
-    # 读取数据集
-    print("Train image dir exists?", os.path.exists(os.path.join(BASE_DATA_DIR, "train", "images")))
     train_pairs = get_image_mask_pairs(
         image_dir=os.path.join(BASE_DATA_DIR, "train", "images"),
         mask_dir=os.path.join(BASE_DATA_DIR, "train", "masks"),
@@ -311,9 +289,9 @@ def train_multi_task_segmentation(logger: logging.Logger):
 
     logger.info(f"数据集大小 -> Train: {len(train_pairs)}, Val: {len(val_pairs)}, Test: {len(test_pairs)}")
     # 创建 Dataset 和 DataLoader
-    train_dataset = SegmentationDataset(train_pairs, processor, TARGET_IMAGE_SIZE, is_training=True, logger=logger)
-    val_dataset = SegmentationDataset(val_pairs, processor, TARGET_IMAGE_SIZE, is_training=False, logger=logger)
-    test_dataset = SegmentationDataset(test_pairs, processor, TARGET_IMAGE_SIZE, is_training=False, logger=logger)
+    train_dataset = SegmentationDataset(train_pairs, TARGET_IMAGE_SIZE, is_train=True)
+    val_dataset = SegmentationDataset(val_pairs, TARGET_IMAGE_SIZE, is_train=False)
+    test_dataset = SegmentationDataset(test_pairs, TARGET_IMAGE_SIZE, is_train=False)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=8, collate_fn=custom_segmentation_collate_fn, pin_memory=True)
@@ -417,7 +395,7 @@ def train_multi_task_segmentation(logger: logging.Logger):
                 break
         else:
             logger.warning("验证阶段无有效批次。")
-        writer.close()
+        
         # === 最终：在 test 集上评估最佳模型 ===
         logger.info("🔍 开始在测试集上评估最佳模型...")
         checkpoint = torch.load(best_model_path, map_location=DEVICE)
@@ -450,7 +428,7 @@ def train_multi_task_segmentation(logger: logging.Logger):
                 f.write(f"pixel_accuracy: {test_metrics['pixel_accuracy']:.6f}\n")
         else:
             logger.error("测试集评估失败：无有效数据。")
-
+    writer.close()
     return None
 
 

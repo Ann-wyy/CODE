@@ -20,6 +20,11 @@ import time
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as T
 
+
+# -----------
+from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
+from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
+
 # --- 配置参数 ---
 MODEL_NAME = "facebook/dinov2-base" 
 TARGET_IMAGE_SIZE = 518 # 图像目标尺寸
@@ -41,23 +46,25 @@ else:
 
 
 # 用户提供的文件路径
-TRAIN_NAME = "BTXRD"
-TRAIN_CSV_PATH = "/home/yyi/data/BTXRD_train.csv"
-VAL_CSV_PATH = "/home/yyi/data/BTXRD_val.csv"
-CSV_PATH = "/home/yyi/data/test_dataset/FracAtlas_dataset.csv" # 标签CSV文件路径
-IMAGE_PATH_COLUMN = 'image_id' # CSV中包含图像相对路径的列名
-LABEL_COLUMNS = ['tumor','benign','malignant'] # 您的所有标签列名
+TRAIN_NAME = f"BoneCancer"
+TRAIN_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_train.csv"
+VAL_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_val.csv"
+TEST_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_test.csv"
+IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
+LABEL_COLUMNS = ['原发/转移','良恶性']  # 您的所有标签列名
 LOAD_LOCAL_CHECKPOINT = True
-TEST_NAME = "boneDinov2_518"
+TEST_NAME = "raddino"
 TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}"
 LOCAL_CHECKPOINT_PATH = "/home/yyi/weight/rad_dino.pth" # 替换为您的本地 .pth 文件路径
 DATA_ROOT_CHECKPOINT = False
 DATA_ROOT = "/data/truenas_B2/yyi/data/boneage-training-dataset" # 图像的根目录
+IGNORE_INDEX = -1
 
 # **新增：日志配置函数**
 FILENAME = f"{TEST_NAME}_{TARGET_IMAGE_SIZE}_{time.strftime('%Y%m%d-%H%M%S')}"
 LOG_FILENAME = os.path.join(f'logs/', f"{FILENAME}.log")
 
+set_seed(RANDOM_SEED) # 设置随机种子
 
 def setup_logging():
     """配置日志记录，输出到文件和控制台。"""
@@ -673,23 +680,23 @@ def train_multi_task_classifier(logger: logging.Logger, val_split_ratio: float =
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
 
     # --- TENSORBOARD 初始化 ---
-    # 使用日志文件名作为 log_dir 的一部分，确保每次运行的日志独立
-    TENSORBOARD_LOG_DIR = os.path.join(f'runs/', FILENAME)
-    writer = SummaryWriter(log_dir=TENSORBOARD_LOG_DIR)
-    logger.info(f"TensorBoard Writer initialized at: {TENSORBOARD_LOG_DIR}")
+    writer = SummaryWriter(log_dir=LOG_DIR)
+    logger.info(f"TensorBoard Writer initialized at: {LOG_DIR}")
+    best_model_path = os.path.join(LOG_DIR, "best_model.pth")
     
 
-    # 2. 初始化整个数据集并进行分割
-    try:
-        train_dataset = MultiTaskImageDataset(
-            root_dir=DATA_ROOT, csv_path=TRAIN_CSV_PATH, img_col=IMAGE_PATH_COLUMN,
-            label_cols=LABEL_COLUMNS, processor=processor, size=TARGET_IMAGE_SIZE,
-            logger=logger,is_training=True
-        )
-    except Exception as e:
-        logger.critical(f"致命错误：训练数据集加载失败。请检查路径和 CSV 文件。")
-        logger.critical(e)
-        return
+    # 读取数据集
+    train_df = pd.read_csv(TRAIN_CSV_PATH)
+    val_df = pd.read_csv(VAL_CSV_PATH)
+    test_df = pd.read_csv(TEST_CSV_PATH)
+    for df in [train_df, val_df, test_df]:
+        df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    logger.info(f"数据集已加载 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    label_encoders = {}
+    num_classes_dict = {}
 
     task_names = train_dataset.all_task_names 
     num_classes_dict = {task: 1 for task in task_names} ## 强制将所有任务的输出类别数设置为 1，以适应 nn.BCEWithLogitsLoss
@@ -796,24 +803,43 @@ def train_multi_task_classifier(logger: logging.Logger, val_split_ratio: float =
             with torch.amp.autocast(device_type=DEVICE):
                 predictions_dict = model(pixel_values)
                 for task_name in model.task_names:
-                    predictions = predictions_dict[task_name]  # shape: (batch_size, 1)
-                    labels = labels_dict[task_name]            # shape: (batch_size)
-                    target = labels.float().view(-1, 1)
-
-                    # 1. 损失计算
+                    logits = predictions_dict[task_name]  # shape: (batch_size, 1)
+                    labels = labels_dict[task_name]   
+                    num_cls = num_classes_dict[task_name]         # shape: (batch_size)
                     task_criterion = criterion_dict[task_name]
-                    task_loss = task_criterion(predictions, target)
-                    combined_loss += task_loss # 累加总损失
+                    task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
+                    if num_cls == 2:
+                        valid_mask = (labels != -1)
+                        valid_count = valid_mask.sum()
+                        if valid_count > 0:
+                            # 过滤 logits 和 labels
+                            valid_logits = logits[valid_mask]
+                            valid_labels = labels[valid_mask]
+                            
+                            # BCEWithLogitsLoss 需要浮点型的 target，形状为 (N, 1)
+                            target = valid_labels.float().view(-1, 1) 
+                            
+                            task_loss = task_criterion(valid_logits, target)
+                        else:
+                             # 如果批次中没有有效样本，损失为 0
+                            task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
+                        # 计算全部样本的概率 (用于指标统计)
+                        probs_pos = torch.sigmoid(logits).squeeze(1) # [N]
+                        # 重新构造 [1-p, p] 格式的概率，用于 metrics
+                        probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) # [N, 2]
+                        # 计算预测值 (0 或 1)
+                        preds = (logits.squeeze(1) > 0).long()
+                    else:
+                        target = labels.long() 
+                        task_loss = task_criterion(logits, target)
+                        probabilities = torch.softmax(logits, dim=1) 
+                        # 计算预测值
+                        preds = torch.argmax(logits, dim=1)
 
-                    # 2. 训练集指标积累 (所有任务)
-                    predictions_logits = predictions.squeeze(1) # shape: (batch_size)
-                    probs = torch.sigmoid(predictions_logits) 
-                    
-                    train_probs_all[task_name].extend(probs.cpu().tolist())
-                    preds = (probs > 0.5).long()
-                    train_preds_all[task_name].extend(preds.cpu().tolist())
-                    safe_labels_list = labels.cpu().reshape(-1).tolist() 
-                    train_labels_all[task_name].extend(safe_labels_list)
+                    combined_loss += task_loss # 累加总损失
+                    train_probs_all[task_name].extend(probabilities.cpu().tolist())
+                    train_labels_all[task_name].extend(labels.cpu().tolist())
+
 
             scaler.scale(combined_loss).backward()
             scaler.step(optimizer)
