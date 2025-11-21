@@ -1,7 +1,7 @@
 import sys
 import os
 # 替换为你的 DINOv3 仓库路径
-REPO_DIR = "/data/dataserver01/zhangruipeng/code/PETCT/dinov3_pretrain/dinov3 "  # ⚠️ 请确保已 clone facebookresearch/dinov3
+REPO_DIR = "/data/dataserver01/zhangruipeng/code/PETCT/dinov3_pretrain/dinov3"  # ⚠️ 请确保已 clone facebookresearch/dinov3
 sys.path.append(REPO_DIR)
 
 import torch
@@ -22,12 +22,14 @@ from dinov3 import vision_transformer as vit
 from dinov3.models import build_model
 
 # ================================导入工具函数====================================
-from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
+from utils import set_seed
  
 # --- 配置参数 ---
 # MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+BACKBONE_NAME = 'vitl16'
+DINOV3_HIDDEN_SIZE = 1024
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 LEARNING_RATE = 0.1
 NUM_EPOCHS = 1
 PATIENCE = 30 # 早停耐心值
@@ -142,16 +144,16 @@ class DinoV3SegmentationModel(nn.Module):
     """
     def __init__(self, model_name: str, num_classes: int, size: int):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
         self.input_device = torch.device(DEVICE)
-        self.num_classes = NUM_CLASSES
-        self.size = TARGET_IMAGE_SIZE # TARGET_IMAGE_SIZE
+        self.num_classes = num_classes
+        self.size = size
+        self.backbone_name = BACKBONE_NAME
 
         # ==================== 根据全局变量加载本地检查点 ====================
         global LOAD_LOCAL_CHECKPOINT, LOCAL_CHECKPOINT_PATH
-
+        # 加载官方主干
         self.backbone = build_model(
-            model_name=backbone_name, 
+            model_name=self.backbone_name, 
             pretrained_weights=None, # 先不加载权重，后面手动加载本地检查点
             out_dim=None, # 如果是分割任务，不需要分类头
             img_size=size,
@@ -159,7 +161,7 @@ class DinoV3SegmentationModel(nn.Module):
         )
         # 确保 backbone 是 nn.Module
         if isinstance(self.backbone, nn.Module):
-            logger.info(f"✅ DINOv3 official backbone ({backbone_name}) loaded.")
+            logger.info(f"✅ DINOv3 official backbone ({self.backbone_name}) loaded.")
         else:
             logger.error("❌ Failed to load DINOv3 official backbone as nn.Module.")
             sys.exit(1)
@@ -179,11 +181,7 @@ class DinoV3SegmentationModel(nn.Module):
                     state_dict = checkpoint
                     print("🔑 Checkpoint is flat. Using top-level state dict.")
                 
-                # 转换键名以匹配 Hugging Face 模型
-                state_dict = convert_dinov3_teacher_to_hf_state_dict(
-                        state_dict, 
-                        model_dim=1024
-                )
+                state_dict = {k: v for k, v in state_dict.items() if not k.startswith('head.')}
 
                 try:
                     # 使用 strict=False 允许忽略不需要的键（如分类头或注册token）
@@ -207,20 +205,18 @@ class DinoV3SegmentationModel(nn.Module):
         # 冻结主干网络参数
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # 定义多个分类头
+
         self.decoder = nn.Sequential(
-            nn.Conv2d(self.backbone.config.hidden_size, 256, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Upsample(size=(self.size, self.size), mode='bilinear', align_corners=False),
+            nn.Conv2d(DINOV3_HIDDEN_SIZE, 256, kernel_size=1), # 将高维特征压缩到较低的 256 维
+            nn.ReLU(inplace=True), # 激活函数，引入非线性
+            nn.Upsample(scale_factor=BATCH_SIZE, mode='bilinear', align_corners=False),
             nn.Conv2d(256, self.num_classes, kernel_size=1)
         )
-        #   卡
         
         # 确保解码器参数是可训练的
         for param in self.decoder.parameters():
              param.requires_grad = True
         
-
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # 运行主干网络（冻结）
         pixel_values = pixel_values.to(self.input_device)
@@ -230,12 +226,16 @@ class DinoV3SegmentationModel(nn.Module):
             outputs = self.backbone(pixel_values=pixel_values)
 
         with torch.no_grad():
-            features = self.backbone.forward_features(x)
-            # features["x_norm_patchtokens"]: [B, N_patches, C]
-            patch_tokens = features["x_norm_patchtokens"]  # ✅ 官方 API，已排除 registers!
+            # 官方 DINOv3 的 forward_features 返回一个字典
+            # features["x_norm_patchtokens"] 已经是 [B, N_patches, C]
+            features = self.backbone.forward_features(pixel_values)
+            patch_tokens = features["x_norm_patchtokens"]
 
         B, N, C = patch_tokens.shape
         h = w = int(N ** 0.5)
+        if h * w != N:
+             logger.error(f"Patch tokens count ({N}) is not a perfect square.")
+             raise ValueError("Patch tokens count is not a perfect square.")
         feature_map = patch_tokens.permute(0, 2, 1).reshape(B, C, h, w)
         return self.decode_head(feature_map)
 
@@ -301,7 +301,7 @@ def train_multi_task_segmentation(logger: logging.Logger):
                              num_workers=8, collate_fn=custom_segmentation_collate_fn, pin_memory=True)
     
     # 初始化模型、损失函数和优化器
-    model = DinoV3SegmentationModel(MODEL_NAME, num_classes=NUM_CLASSES, size=TARGET_IMAGE_SIZE).to(DEVICE)
+    model = DinoV3SegmentationModel(BACKBONE_NAME, num_classes=NUM_CLASSES, size=TARGET_IMAGE_SIZE).to(DEVICE)
     criterion = nn.CrossEntropyLoss(ignore_index=-1)
     
     # 仅优化分类头参数 (假设主干网络冻结)
@@ -309,9 +309,7 @@ def train_multi_task_segmentation(logger: logging.Logger):
 
     # 初始化 GradScaler
     scaler = torch.amp.GradScaler('cuda')
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-4
-    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-4)
     logger.info(f"学习率调度器 ReduceLROnPlateau 已初始化，监控模式: max, 降低耐心值: 10")
 
     logger.info(f"模型已加载，在设备 {DEVICE} 上训练...")
@@ -322,8 +320,6 @@ def train_multi_task_segmentation(logger: logging.Logger):
     for epoch in range(NUM_EPOCHS):
         total_combined_loss = 0
         model.train()
-        total_loss = 0.0
-        num_batches = 0
 
         # 训练步骤
         for step, batch in enumerate(train_loader):
@@ -441,6 +437,7 @@ if __name__ == "__main__":
     main_logger.info(f"类别数: {NUM_CLASSES}")
     main_logger.info(f"BATCH_SIZE: {BATCH_SIZE}")
     main_logger.info(f"LEARNING_RATE: {LEARNING_RATE}")
+    main_logger.info(f"DINOv3 BACKBONE: {BACKBONE_NAME}, Hidden Size: {1024}")
 
     trained_model = train_multi_task_segmentation(main_logger)
 
