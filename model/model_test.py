@@ -23,8 +23,8 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 # ================================导入工具函数====================================
-from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
-from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
+from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
+from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
@@ -39,21 +39,17 @@ RANDOM_SEED = 42 # 42, 100, 600, 1000, 2025
 DEVICE = "cuda:7"
 
 # 用户提供的文件路径
-TRAIN_NAME = f"BoneCancer"
-TRAIN_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_train.csv"
-VAL_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_val.csv"
-TEST_CSV_PATH = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_test.csv"
+TRAIN_NAME = f"FracAtlas"
+CSV_PATH = "/home/yyi/data/test_dataset/FracAtlas_dataset.csv" # 标签CSV文件路径
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
-LABEL_COLUMNS = ['原发/转移','良恶性']  # 您的所有标签列名
-OVR_TASK_NAMES = ['良恶性'] # 需要OVR的标签
-LOAD_LOCAL_CHECKPOINT = False # 是否加载本地检查点
+LABEL_COLUMNS = ['Fractured']  # 您的所有标签列名
+LOAD_LOCAL_CHECKPOINT = True # 是否加载本地检查点
 if LOAD_LOCAL_CHECKPOINT:
-    TEST_NAME = "boneDinov3"
+    TEST_NAME = "boneDinov3_103499"
 else:
     TEST_NAME = "Dinov3"
 TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
-LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_99499/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
-IGNORE_INDEX = -1
+LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_165999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 
 # **新增：日志配置函数**
 LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
@@ -79,58 +75,11 @@ def setup_logging():
 logger = setup_logging() # 初始化全局日志记录器
 logger.info(f"随机种子: {RANDOM_SEED}")
 
-# ----------------------
-def expand_ovr_columns(df: pd.DataFrame, ovr_cols: List[str], label_encoders: Dict[str, Any], ignore_index: int, logger: logging.Logger) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    将 DataFrame 中指定的 OVR 列 (已编码为整数) 拆分成多个二分类列。
-    
-    Args:
-        df: 待处理的 DataFrame。
-        ovr_cols: 需要 OVR 分解的原始列名列表。
-        label_encoders: 包含原始列 LabelEncoder 的字典。
-        ignore_index: 忽略值的整数标记 (如 -1)。
-        logger: 日志记录器。
-        
-    Returns:
-        Tuple[pd.DataFrame, List[str]]: 包含新列的 DataFrame 和所有新/旧标签列名列表。
-    """
-    new_df = df.copy()
-    new_label_cols = [col for col in LABEL_COLUMNS if col not in ovr_cols] # 先保留非 OVR 任务
-    
-    for task_name in ovr_cols:
-        le = label_encoders[task_name]
-        num_classes = len(le.classes_)
-        
-        if num_classes <= 2:
-            new_label_cols.append(task_name)
-            continue
-        
-        ignore_mask = (new_df[task_name] == ignore_index)
-        
-        # 2. 对每个类别创建新的二分类列
-        for class_idx in range(num_classes):
-            new_col_name = f"{task_name}_OVR_{class_idx}"
-            
-            # 初始化新列：默认值设为 0 (负类)
-            new_df[new_col_name] = 0
-            
-            # 将对应类别的样本标记为 1 (正类)
-            new_df.loc[new_df[task_name] == class_idx, new_col_name] = 1
-            
-            # 将原始的忽略样本在新列中也标记为忽略值
-            new_df.loc[ignore_mask, new_col_name] = ignore_index
-            
-            new_label_cols.append(new_col_name) # 添加新的标签列名
-            
-        # 3. 删除原始 OVR 任务列 (或者选择保留原始列，但通常为了避免混淆，最好删除)
-        del new_df[task_name]
-        
-    return new_df, new_label_cols
-
 
 # --- 自定义 PyTorch Dataset (处理多列分类标签) ---
 class MultiTaskImageDatasetFromDataFrame(Dataset):
-    def __init__(self, df: pd.DataFrame, img_col: str, label_cols: List[str], processor: AutoImageProcessor, 
+    def __init__(self, df: pd.DataFrame, img_col: str, 
+                 label_cols: List[str], processor: AutoImageProcessor, 
                  size: int, logger: logging.Logger, is_training: bool = False):
         self.df = df
         self.img_col = img_col
@@ -167,8 +116,8 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
 
         labels_dict = {}
         for task in self.label_cols:
-            label_val = row[task] # 已经是编码后的 int 
-            # 所有标签现在都是标量
+            label_val = row[task]
+            # 如果 label_val == -1（未知类别），可在此返回 None 或保留（后续 loss 忽略需特殊处理）
             labels_dict[task] = torch.tensor(label_val, dtype=torch.long)
 
         return pixel_values, labels_dict, img_path
@@ -296,7 +245,6 @@ class DinoV3MultiTaskClassifier(nn.Module):
 
 # --- 训练函数 (新增日志和早停逻辑) ---
 def train_multi_task_classifier(logger: logging.Logger):
-    global LABEL_COLUMNS, OVR_TASK_NAMES, IGNORE_INDEX
     # 1. 初始化预处理器
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
     if LOAD_LOCAL_CHECKPOINT:
@@ -309,69 +257,39 @@ def train_multi_task_classifier(logger: logging.Logger):
     best_model_path = os.path.join(LOG_DIR, "best_model.pth")
 
     # 读取数据集
-    train_df = pd.read_csv(TRAIN_CSV_PATH)
-    val_df = pd.read_csv(VAL_CSV_PATH)
-    test_df = pd.read_csv(TEST_CSV_PATH)
-    for df in [train_df, val_df, test_df]:
-        df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-    logger.info(f"数据集已加载 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    total_df = pd.read_csv(CSV_PATH)
+    total_df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
+    logger.info(f"总数据集（去除无效路径后）: {len(total_df)}")
+    total_df = total_df.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+    train_val_df, test_df = train_test_split(
+        total_df, test_size=0.2, stratify=total_df[LABEL_COLUMNS[0]], random_state=RANDOM_SEED
+    )
+    train_df, val_df = train_test_split(
+        train_val_df, test_size=0.25, stratify=train_val_df[LABEL_COLUMNS[0]], random_state=RANDOM_SEED
+    )
+    logger.info(f"划分完成 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
     label_encoders = {}
     num_classes_dict = {}
 
     for col in LABEL_COLUMNS:
         le = LabelEncoder()
-        train_labels_str = train_df[col].astype(str).copy()
-        ignore_mask_train = (train_labels_str == '-1')
-        train_labels_for_fit = train_labels_str.loc[~ignore_mask_train]
-        le.fit(train_labels_for_fit)
-        encoded_labels_train = pd.Series(le.transform(train_labels_for_fit), 
-                                         index=train_labels_for_fit.index)
         # 拟合训练集
-        new_train_labels = pd.Series(-1, index=train_df.index, dtype=np.int64)
-        new_train_labels.loc[~ignore_mask_train] = encoded_labels_train.values
-        
-        train_df[col] = new_train_labels.astype(int)
+        train_labels_str = train_df[col].astype(str)
+        train_df[col] = le.fit_transform(train_labels_str)
 
         # 转换 val/test
-        # --- 2. 转换 val/test ---
         for name, df in [("Val", val_df), ("Test", test_df)]:
-            df_labels_str = df[col].astype(str).copy()
-            # 找到要忽略的标签
-            ignore_mask_df = (df_labels_str == '-1')
-            
-            # 找到需要转换的有效标签
-            df_labels_to_transform = df_labels_str.loc[~ignore_mask_df]
-            new_df_labels = pd.Series(-1, index=df.index,dtype=np.int64)
-
             try:
-                # 转换有效标签
-                encoded_labels_df = pd.Series(le.transform(df_labels_to_transform), 
-                                             index=df_labels_to_transform.index)
-                
-                # 将编码后的有效标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = encoded_labels_df 
-
+                df[col] = le.transform(df[col].astype(str))
             except ValueError as e:
-                # 这段代码用于处理 Val/Test 集中出现了训练集 le.classes_ 中没有的**新**类别
                 logger.warning(f"{name} set contains unseen labels in '{col}': {e}. Mapping unknown to -1.")
-                
+                # 构建映射字典，未知设为 -1
                 label_to_idx = {label: idx for idx, label in enumerate(le.classes_)}
-                
-                # 对有效标签进行映射，如果遇到新类别则映射为 -1
-                mapped_labels = df_labels_to_transform.map(label_to_idx).fillna(-1).astype(int)
-                
-                # 将映射后的标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = mapped_labels 
-
-            # 最后将处理好的 Series 赋回 DataFrame
-            df[col] = new_df_labels.astype(int)
+                df[col] = df[col].astype(str).map(label_to_idx).fillna(-1).astype(int)
 
         label_encoders[col] = le
-        # 类别数只包含有效标签
         num_classes_dict[col] = len(le.classes_)
+        logger.info(f"任务 '{col}': 类别 {list(le.classes_)} → 编码 [0..{len(le.classes_)-1}], 共 {len(le.classes_)} 类")
 
         if num_classes_dict[col] == 2:
             # 1. 找出当前编码下的类别频率
@@ -397,27 +315,6 @@ def train_multi_task_classifier(logger: logging.Logger):
                 
                 else:
                     logger.info(f"任务 '{col}' 的少数类已被正确编码为 1。无需反转。")
-    
-    train_df, new_train_label_cols = expand_ovr_columns(
-        train_df, OVR_TASK_NAMES, label_encoders, IGNORE_INDEX, logger
-    )
-    val_df, new_val_label_cols = expand_ovr_columns(
-        val_df, OVR_TASK_NAMES, label_encoders, IGNORE_INDEX, logger
-    )
-    test_df, new_test_label_cols = expand_ovr_columns(
-        test_df, OVR_TASK_NAMES, label_encoders, IGNORE_INDEX, logger
-    )
-    LABEL_COLUMNS = new_train_label_cols
-    logger.info(f"所有标签列名: {LABEL_COLUMNS}")
-    final_num_classes_dict = {}
-    for task in LABEL_COLUMNS:
-        # 如果是 OVR 分解出来的任务，类别数就是 2 (0和1)
-        if "_OVR_" in task:
-            final_num_classes_dict[task] = 2
-        else:
-            # 否则使用原始的类别数
-            final_num_classes_dict[task] = num_classes_dict[task]
-    num_classes_dict = final_num_classes_dict
     
     def create_dataset(df, is_train=False):
         return MultiTaskImageDatasetFromDataFrame(
@@ -489,12 +386,12 @@ def train_multi_task_classifier(logger: logging.Logger):
             criterion_dict[task] = nn.BCEWithLogitsLoss(pos_weight=pos_weight_scalar)
             
         elif num_cls > 2:
-            criterion_dict[task] = nn.CrossEntropyLoss(weight=weight, ignore_index=IGNORE_INDEX)
+            criterion_dict[task] = nn.CrossEntropyLoss(weight=weight)
             logger.info(f"任务 '{task}' 的 CrossEntropyLoss 使用 class weights: {weight.cpu().numpy()}")
             
         else:
-            logger.error(f"任务 '{task}' 的类别数 {num_cls} 无效。使用默认 CrossEntropyLoss。")
-            criterion_dict[task] = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+            logger.error(f"任务 '{task}' 的类别数 {num_cls} 无效。使用默认 BCEWithLogitsLoss。")
+            criterion_dict[task] = nn.BCEWithLogitsLoss()
     
     # 仅优化分类头参数 (假设主干网络冻结)
     optimizer = torch.optim.AdamW(model.classifiers.parameters(), lr=LEARNING_RATE)
@@ -546,35 +443,21 @@ def train_multi_task_classifier(logger: logging.Logger):
                 for task_name in model.task_names:
                     logits = predictions_dict[task_name]  # shape: (batch_size, 1)
                     labels = labels_dict[task_name]   
-                    num_cls = num_classes_dict[task_name]        # shape: (batch_size)
+                    num_cls = num_classes_dict[task_name]         # shape: (batch_size)
+
+                    # 1. 损失计算
                     task_criterion = criterion_dict[task_name]
-                    task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
-
-                    valid_mask = (labels != -1)
-                    valid_count = valid_mask.sum()
-                    if valid_count == 0:
-                        continue
-
-                    valid_logits = logits[valid_mask].view(-1, 1) # [N_valid, 1]
-                    valid_labels = labels[valid_mask].long()      # [N_valid]
-
                     if num_cls == 2:
-                        valid_mask = (labels != -1)
-                        valid_count = valid_mask.sum()
-                            
-                        # BCEWithLogitsLoss 需要浮点型的 target，形状为 (N, 1)
-                        target = valid_labels.float().view(-1, 1) 
-                        
-                        task_loss = task_criterion(valid_logits, target)
-                        # 计算全部样本的概率 (用于指标统计)
+                        target = labels.float().view(-1, 1) 
                         probs_pos = torch.sigmoid(logits).squeeze(1) # [N]
-                        # 重新构造 [1-p, p] 格式的概率，用于 metrics
                         probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) # [N, 2]
+                        preds = (logits.squeeze(1) > 0).long()
                     else:
-                        target = valid_labels.long() 
-                        task_loss = task_criterion(valid_logits , target)
-                        probabilities = torch.softmax(valid_logits , dim=1) 
+                        target = labels.long() 
+                        probabilities = torch.softmax(logits, dim=1) 
+                        preds = torch.argmax(logits, dim=1)
 
+                    task_loss = task_criterion(logits, target)
                     combined_loss += task_loss # 累加总损失
                     train_probs_all[task_name].extend(probabilities.cpu().tolist())
                     train_labels_all[task_name].extend(labels.cpu().tolist())
@@ -625,7 +508,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             logger
         )
         key_task = model.task_names[0]
-        val_score = val_metrics[key_task]['auprc']
+        val_score = val_metrics[key_task]['auroc']
         # === 新增：学习率调度器步进 ===
         scheduler.step(val_score) 
         current_lr = optimizer.param_groups[0]['lr']
@@ -634,7 +517,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             best_val_score = val_score
             patience_counter = 0
             best_epoch = epoch + 1
-            logger.info(f"最佳模型auprc分数: {best_val_score:.4f}")
+            logger.info(f"最佳模型auroc分数: {best_val_score:.4f}")
             try:
                 torch.save({
                     'epoch': best_epoch,

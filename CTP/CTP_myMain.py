@@ -4,13 +4,15 @@ from config import *
 import os
 import glob
 import logging
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 # ==============================
 # 配置日志
 # ==============================
 logging.basicConfig(
     level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S'
+    filename='/data/truenas_B2/yyi/logs/perfusion_processing.log',  # ← 指定文件路径
+    filemode='a'
 )
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ Smaller adjustments such as thresholds and kernel sizes can be adjusted in the r
 PyPeT assumes a specific directory structure for the dataset. The required structure is described in the README file.
 """
 
-root_dir = "/data/truenas_36T/HeadStroke_Yan"
+root_dir = "/data/truenas_B2/yyi/CTP"
 logger.info(f"Started processing... root_dir = {root_dir}")
 
 # Get all subdirectories that match pattern a* (e.g., a106369160)

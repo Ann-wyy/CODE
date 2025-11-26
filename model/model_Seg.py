@@ -22,7 +22,7 @@ from dinov3 import vision_transformer as vit
 from dinov3.models import build_model
 
 # ================================导入工具函数====================================
-from utils import set_seed
+from CODE.model.utils.utils import set_seed
  
 # --- 配置参数 ---
 # MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"

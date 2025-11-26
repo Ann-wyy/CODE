@@ -22,8 +22,8 @@ import torchvision.transforms as T
 
 
 # -----------
-from utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
-from metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
+from CODE.model.utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
+from CODE.model.utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
 
 # --- 配置参数 ---
 MODEL_NAME = "facebook/dinov2-base" 

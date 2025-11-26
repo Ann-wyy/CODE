@@ -11,7 +11,7 @@ from transformers import AutoImageProcessor, AutoModel
 
 from collections import OrderedDict
 
-from utils import convert_dinov3_teacher_to_hf_state_dict
+from CODE.model.utils.utils import convert_dinov3_teacher_to_hf_state_dict
 
 
 # --- 核心函数：合并所有步骤，不绘制对比图 ---
