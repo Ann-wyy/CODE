@@ -23,32 +23,36 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 # ================================导入工具函数====================================
-from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
+from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
 from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
-MODEL_NAME = "facebook/dinov2-base" 
+MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 256
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.001
 NUM_EPOCHS = 100
 PATIENCE = 30 # 早停耐心值
-RANDOM_SEED = 42 # 42, 100, 600, 1000, 2025
+RANDOM_SEED = 42 # 42, 100, 601, 1010, 2025
 
 # 自动选择 GPU 设备，优先使用 cuda:0
-DEVICE = "cuda:7"
+DEVICE = "cuda:6"
 
 # 用户提供的文件路径
-TRAIN_NAME = "BoneCancer_benign"
+TRAIN_NAME = "CancerBenign"
 TRAIN_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_train.csv"
 VAL_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_val.csv"
 TEST_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_test.csv"
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
 LABEL_COLUMNS = ['label']  # 您的所有标签列名
-LOAD_LOCAL_CHECKPOINT = True # 是否加载本地检查点
-TEST_NAME = "RadDino"
+TEXT_COLS = ['性别', 'age', 'BodyPart']
+LOAD_LOCAL_CHECKPOINT = False # 是否加载本地检查点
+if LOAD_LOCAL_CHECKPOINT:
+    TEST_NAME = "xrayDinov3_ReLU"
+else:
+    TEST_NAME = "Dinov3_ReLU"
 TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
-LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/weight/rad_dino.pth" # 替换为您的本地 .pth 文件路径
+LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_186999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 IGNORE_INDEX = -1
 
 # **新增：日志配置函数**
@@ -75,18 +79,41 @@ def setup_logging():
 logger = setup_logging() # 初始化全局日志记录器
 logger.info(f"随机种子: {RANDOM_SEED}")
 
+# clinical
+class ClinicalEncoder:
+    def __init__(self, df, text_cols):
+        # 性别映射
+        self.gender_map = {val: i for i, val in enumerate(df['性别'].unique())}
+        # 部位映射
+        self.body_part_map = {val: i for i, val in enumerate(df['BodyPart'].unique())}
+        # 记录维度
+        self.clinical_dim = 1 + len(self.gender_map) + len(self.body_part_map)
+
+    def encode(self, row):
+        # 1. 年龄归一化 (假设最大100岁)
+        age = torch.tensor([float(row['age']) / 100.0], dtype=torch.float32)
+        # 2. 性别 One-hot
+        gender = torch.zeros(len(self.gender_map))
+        gender[self.gender_map[row['性别']]] = 1.0
+        # 3. 部位 One-hot
+        body = torch.zeros(len(self.body_part_map))
+        body[self.body_part_map[row['BodyPart']]] = 1.0
+        
+        return torch.cat([age, gender, body])
+
 
 # --- 自定义 PyTorch Dataset (处理多列分类标签) ---
 class MultiTaskImageDatasetFromDataFrame(Dataset):
     def __init__(self, df: pd.DataFrame, img_col: str, 
                  label_cols: List[str], processor: AutoImageProcessor, 
-                 size: int, logger: logging.Logger, is_training: bool = False):
+                 size: int, logger: logging.Logger,clinical_encoder, is_training: bool = False):
         self.df = df
         self.img_col = img_col
         self.label_cols = label_cols
         self.processor = processor
         self.size = size
         self.logger = logger
+        self.clinical_encoder = clinical_encoder
 
         if is_training:
             self.transform = T.Compose([
@@ -113,6 +140,7 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
             image = self.transform(image)
         inputs = self.processor(images=image, size=self.size, return_tensors="pt")
         pixel_values = inputs["pixel_values"].squeeze(0)
+        clinical_values = self.clinical_encoder.encode(row)
 
         labels_dict = {}
         for task in self.label_cols:
@@ -120,7 +148,7 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
             # 如果 label_val == -1（未知类别），可在此返回 None 或保留（后续 loss 忽略需特殊处理）
             labels_dict[task] = torch.tensor(label_val, dtype=torch.long)
 
-        return pixel_values, labels_dict, img_path
+        return pixel_values, clinical_values, labels_dict, img_path
 
 
 
@@ -128,21 +156,52 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
 # 2. custom_collate_fn 实现
 # ====================================================================
 
-def custom_collate_fn(batch: List[Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], List[str]]:
+def custom_collate_fn(batch):
     batch = [item for item in batch if item[0] is not None]
-    if not batch:
-        return None
+    if not batch: return None
 
     pixel_values = torch.stack([item[0] for item in batch])
+    clinical_values = torch.stack([item[1] for item in batch]) # 新增
     
-    task_names = list(batch[0][1].keys())
-    labels_dict = {}
-    for task_name in task_names:
-        labels = [item[1][task_name] for item in batch]
-        labels_dict[task_name] = torch.stack(labels)  # shape: [N]
+    # 保持 labels 处理逻辑不变
+    task_names = list(batch[0][2].keys())
+    labels_dict = {name: torch.stack([item[2][name] for item in batch]) for name in task_names}
+    img_paths = [item[3] for item in batch]
+    
+    return pixel_values, clinical_values, labels_dict, img_paths
 
-    img_paths = [item[2] for item in batch]
-    return pixel_values, labels_dict, img_paths
+
+# ---- Gated ---
+class GatedFusionHead(nn.Module):
+    def __init__(self, image_dim, clinical_dim, output_dim):
+        super().__init__()
+        # 投影层：将不同模态对齐到同一维度
+        self.img_proj = nn.Sequential(nn.Linear(image_dim, 512), nn.ReLU())
+        self.cli_proj = nn.Sequential(nn.Linear(clinical_dim, 512), nn.ReLU())
+        
+        # 门控网络：学习一个权重来平衡两者的重要性
+        self.gate = nn.Sequential(
+            nn.Linear(512 + 512, 512),
+            nn.Sigmoid()
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, output_dim)
+        )
+
+    def forward(self, img_feat, cli_feat):
+        i_p = self.img_proj(img_feat)
+        c_p = self.cli_proj(cli_feat)
+        
+        # 计算门控值
+        g = self.gate(torch.cat([i_p, c_p], dim=1))
+        
+        # 融合：如果g趋近1则偏向图像，趋近0则偏向临床
+        fused = g * i_p + (1 - g) * c_p
+        return self.classifier(fused)
 
 # --- 自定义模型：DINOv3 + 多个分类头 ---
 
@@ -150,7 +209,7 @@ class DinoV3MultiTaskClassifier(nn.Module):
     """
     基于 DINOv3 主干网络，带有多任务分类头。
     """
-    def __init__(self, model_name: str, task_num_classes: Dict[str, int]):
+    def __init__(self, model_name: str, task_num_classes: Dict[str, int], clinical_dim):
         super().__init__()
 
         self.task_names = list(task_num_classes.keys())
@@ -209,23 +268,16 @@ class DinoV3MultiTaskClassifier(nn.Module):
         # 定义多个分类头
         self.classifiers = nn.ModuleDict()
         for task_name, num_classes in task_num_classes.items():
-            if num_classes == 2:
-                output_dim = 1
-            elif num_classes > 2:
-                output_dim = num_classes
-            else:
-                logger.warning(f"警告：任务 '{task_name}' 的类别数 {num_classes} 无效。设置为 1。")
-                output_dim = 1
-            self.classifiers[task_name] = nn.Linear(feature_dim, output_dim)
-            # 确保分类头参数是可训练的
-            for param in self.classifiers[task_name].parameters():
-                 param.requires_grad = True
+            out_dim = 1 if num_classes == 2 else num_classes
+            self.classifiers[task_name] = GatedFusionHead(feature_dim, clinical_dim, out_dim)
+
         
 
         
-    def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor, clinical_values):
         # 运行主干网络（冻结）
         pixel_values = pixel_values.to(self.input_device)
+        clinical_values = clinical_values.to(DEVICE)
         
         # 即使主干网络冻结，也要确保它在正确的设备上运行
         with torch.no_grad():
@@ -237,9 +289,10 @@ class DinoV3MultiTaskClassifier(nn.Module):
         # 运行各个分类头
         logits = {}
         for task_name in self.task_names:
-            logits[task_name] = self.classifiers[task_name](global_feature)
+            logits[task_name] = self.classifiers[task_name](global_feature, clinical_values)
 
         return logits
+    
 
 
 
@@ -268,84 +321,13 @@ def train_multi_task_classifier(logger: logging.Logger):
     logger.info(f"数据集已加载 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
     label_encoders = {}
     num_classes_dict = {}
+    # 初始化编码器 (自动计算维度)
+    clinical_encoder = ClinicalEncoder(train_df, TEXT_COLS)
+    clinical_dim = clinical_encoder.clinical_dim
+    logger.info(f"临床特征维度: {clinical_dim}")
 
-    for col in LABEL_COLUMNS:
-        le = LabelEncoder()
-        train_labels_str = train_df[col].astype(str).copy()
-        ignore_mask_train = (train_labels_str == '-1')
-        train_labels_for_fit = train_labels_str.loc[~ignore_mask_train]
-        le.fit(train_labels_for_fit)
-        encoded_labels_train = pd.Series(le.transform(train_labels_for_fit), 
-                                         index=train_labels_for_fit.index)
-        # 拟合训练集
-        new_train_labels = pd.Series(-1, index=train_df.index, dtype=np.int64)
-        new_train_labels.loc[~ignore_mask_train] = encoded_labels_train.values
-        
-        train_df[col] = new_train_labels.astype(int)
-
-        # 转换 val/test
-        # --- 2. 转换 val/test ---
-        for name, df in [("Val", val_df), ("Test", test_df)]:
-            df_labels_str = df[col].astype(str).copy()
-            # 找到要忽略的标签
-            ignore_mask_df = (df_labels_str == '-1')
-            
-            # 找到需要转换的有效标签
-            df_labels_to_transform = df_labels_str.loc[~ignore_mask_df]
-            new_df_labels = pd.Series(-1, index=df.index,dtype=np.int64)
-
-            try:
-                # 转换有效标签
-                encoded_labels_df = pd.Series(le.transform(df_labels_to_transform), 
-                                             index=df_labels_to_transform.index)
-                
-                # 将编码后的有效标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = encoded_labels_df 
-
-            except ValueError as e:
-                # 这段代码用于处理 Val/Test 集中出现了训练集 le.classes_ 中没有的**新**类别
-                logger.warning(f"{name} set contains unseen labels in '{col}': {e}. Mapping unknown to -1.")
-                
-                label_to_idx = {label: idx for idx, label in enumerate(le.classes_)}
-                
-                # 对有效标签进行映射，如果遇到新类别则映射为 -1
-                mapped_labels = df_labels_to_transform.map(label_to_idx).fillna(-1).astype(int)
-                
-                # 将映射后的标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = mapped_labels 
-
-            # 最后将处理好的 Series 赋回 DataFrame
-            df[col] = new_df_labels.astype(int)
-
-        label_encoders[col] = le
-        # 类别数只包含有效标签
-        num_classes_dict[col] = len(le.classes_)
-        logger.info(f"任务 '{col}': 类别 {list(le.classes_)} → 编码 [0..{len(le.classes_)-1}], 共 {len(le.classes_)} 类")
-
-        if num_classes_dict[col] == 2:
-            # 1. 找出当前编码下的类别频率
-            encoded_labels = train_df[col].loc[train_df[col] != -1]
-            counts = encoded_labels.value_counts()
-            
-            # 假设只有 0 和 1 两种编码
-            if len(counts) == 2:
-                # 找出少数类在当前编码下的值 (0 或 1)
-                minority_encoded_value = counts.idxmin() # 频率最小的编码值
-                
-                # 如果少数类的编码值不是 1，则需要反转 0 和 1
-                if minority_encoded_value == 0:
-                    logger.warning(f"任务 '{col}' 的少数类被编码为 0。正在反转标签 0 <-> 1...")
-                    
-                    # 定义映射规则：0 -> 1, 1 -> 0
-                    mapping = {0: 1, 1: 0}
-                    
-                    # 对所有数据集应用映射
-                    for df in [train_df, val_df, test_df]:
-                        # 只对 0 和 1 进行映射，-1 保持不变
-                        df[col] = df[col].replace(mapping)
-                
-                else:
-                    logger.info(f"任务 '{col}' 的少数类已被正确编码为 1。无需反转。")
+    train_df, val_df, test_df, num_classes_dict = preprocess_labels_and_setup_datasets(TRAIN_CSV_PATH, 
+        VAL_CSV_PATH, TEST_CSV_PATH, LABEL_COLUMNS, IMAGE_PATH_COLUMN, logger)
     
     def create_dataset(df, is_train=False):
         return MultiTaskImageDatasetFromDataFrame(
@@ -355,6 +337,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             processor=processor,
             size=TARGET_IMAGE_SIZE,
             logger=logger,
+            clinical_encoder=clinical_encoder,
             is_training=is_train
         )
     
@@ -393,7 +376,7 @@ def train_multi_task_classifier(logger: logging.Logger):
         task_weights[task] = weight
 
     # 初始化模型、损失函数和优化器
-    model = DinoV3MultiTaskClassifier(MODEL_NAME, num_classes_dict).to(DEVICE)
+    model = DinoV3MultiTaskClassifier(MODEL_NAME, num_classes_dict, clinical_dim).to(DEVICE)
     # 创建任务特定的加权损失函数字典
     criterion_dict = {}
     for task in LABEL_COLUMNS:
@@ -432,7 +415,7 @@ def train_multi_task_classifier(logger: logging.Logger):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='max',                 # 监控分数，所以使用 'max'
-        factor=0.5,                 # 每次降低为原来的 1/2
+        factor=0.1,                 # 每次降低为原来的 1/2
         patience=10,               # 多少个 epoch 不改善后触发
         min_lr=1e-4             # 学习率下限
     )
@@ -459,9 +442,10 @@ def train_multi_task_classifier(logger: logging.Logger):
             if batch is None:
                 logger.warning("Received an empty batch after filtering corrupt files. Skipping step.")
                 continue
-            pixel_values, labels_dict, img_paths = batch
+            pixel_values, clinical_values, labels_dict, img_paths = batch
             batch_size = pixel_values.size(0)
             pixel_values = pixel_values.to(DEVICE)
+            clinical_values = clinical_values.to(DEVICE)
             for task in labels_dict:
                 labels_dict[task] = labels_dict[task].to(DEVICE)
 
@@ -470,40 +454,38 @@ def train_multi_task_classifier(logger: logging.Logger):
             train_paths_all.extend(img_paths)
 
             with torch.amp.autocast(device_type=DEVICE):
-                predictions_dict = model(pixel_values)
+                predictions_dict = model(pixel_values, clinical_values)
                 for task_name in model.task_names:
                     logits = predictions_dict[task_name]  # shape: (batch_size, 1)
                     labels = labels_dict[task_name]   
                     num_cls = num_classes_dict[task_name]         # shape: (batch_size)
                     task_criterion = criterion_dict[task_name]
                     task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
+
+                    valid_mask = (labels != -1)
+                    valid_count = valid_mask.sum()
+                    if valid_count == 0:
+                        continue
+
+                    valid_logits = logits[valid_mask]
+                    valid_labels = labels[valid_mask].long()      # [N_valid]
+
                     if num_cls == 2:
                         valid_mask = (labels != -1)
                         valid_count = valid_mask.sum()
-                        if valid_count > 0:
-                            # 过滤 logits 和 labels
-                            valid_logits = logits[valid_mask]
-                            valid_labels = labels[valid_mask]
                             
-                            # BCEWithLogitsLoss 需要浮点型的 target，形状为 (N, 1)
-                            target = valid_labels.float().view(-1, 1) 
-                            
-                            task_loss = task_criterion(valid_logits, target)
-                        else:
-                             # 如果批次中没有有效样本，损失为 0
-                            task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
+                        # BCEWithLogitsLoss 需要浮点型的 target，形状为 (N, 1)
+                        target = valid_labels.float().view(-1, 1) 
+                        
+                        task_loss = task_criterion(valid_logits, target)
                         # 计算全部样本的概率 (用于指标统计)
                         probs_pos = torch.sigmoid(logits).squeeze(1) # [N]
                         # 重新构造 [1-p, p] 格式的概率，用于 metrics
                         probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) # [N, 2]
-                        # 计算预测值 (0 或 1)
-                        preds = (logits.squeeze(1) > 0).long()
                     else:
-                        target = labels.long() 
-                        task_loss = task_criterion(logits, target)
-                        probabilities = torch.softmax(logits, dim=1) 
-                        # 计算预测值
-                        preds = torch.argmax(logits, dim=1)
+                        target = valid_labels.long() 
+                        task_loss = task_criterion(valid_logits , target)
+                        probabilities = torch.softmax(logits , dim=1) 
 
                     combined_loss += task_loss # 累加总损失
                     train_probs_all[task_name].extend(probabilities.cpu().tolist())
@@ -555,7 +537,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             logger
         )
         key_task = model.task_names[0]
-        val_score = val_metrics[key_task]['auprc']
+        val_score = val_metrics[key_task]['auroc']
         # === 新增：学习率调度器步进 ===
         scheduler.step(val_score) 
         current_lr = optimizer.param_groups[0]['lr']
@@ -564,7 +546,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             best_val_score = val_score
             patience_counter = 0
             best_epoch = epoch + 1
-            logger.info(f"最佳模型auprc分数: {best_val_score:.4f}")
+            logger.info(f"最佳模型auroc分数: {best_val_score:.4f}")
             try:
                 torch.save({
                     'epoch': best_epoch,

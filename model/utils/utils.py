@@ -155,85 +155,63 @@ def convert_dinov3_teacher_to_hf_state_dict(
     return state_dict_renamed
 
 
-def preprocess_labels_and_setup_datasets(TRAIN_CSV_PATH, VAL_CSV_PATH, TEST_CSV_PATH, LABEL_COLUMNS,IMAGE_PATH_COLUMN, logger):
-    """
-    加载CSV文件，对多任务标签进行编码，处理未知标签为-1，
-    并为二分类任务将少数类编码为 1。
-    """
-    # 1. 加载数据
-    try:
-        train_df = pd.read_csv(TRAIN_CSV_PATH)
-        val_df = pd.read_csv(VAL_CSV_PATH)
-        test_df = pd.read_csv(TEST_CSV_PATH)
-    except FileNotFoundError as e:
-        logger.error(f"加载CSV文件失败: {e}")
-        raise
+def preprocess_labels_and_setup_datasets(TRAIN_CSV_PATH, VAL_CSV_PATH, TEST_CSV_PATH, LABEL_COLUMNS, IMAGE_PATH_COLUMN, logger):
+    import pandas as pd
+    import numpy as np
+    from sklearn.preprocessing import LabelEncoder
 
-    for df in [train_df, val_df, test_df]:
-        df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
-    label_encoders = {}
+    def load_and_clean(path):
+        df = pd.read_csv(path)
+        # 严格清理：只保留路径和标签都不为空的行
+        df = df.dropna(subset=[IMAGE_PATH_COLUMN]).reset_index(drop=True)
+        return df
+
+    train_df = load_and_clean(TRAIN_CSV_PATH)
+    val_df = load_and_clean(VAL_CSV_PATH)
+    test_df = load_and_clean(TEST_CSV_PATH)
+
     num_classes_dict = {}
 
-    from sklearn.preprocessing import LabelEncoder
-    
     for col in LABEL_COLUMNS:
+        # 1. 提取训练集中的有效标签用于拟合
+        # 过滤掉 -1, "-1", "nan", "None"
+        raw_train_values = train_df[col].astype(str).str.strip()
+        valid_mask = ~raw_train_values.isin(['-1', '-1.0', 'nan', 'None', ''])
+        valid_labels = raw_train_values[valid_mask]
+
+        if len(valid_labels) == 0:
+            logger.error(f"任务 '{col}' 在训练集中没有有效标签！")
+            continue
+
         le = LabelEncoder()
-        train_labels_str = train_df[col].astype(str).copy()
-        ignore_mask_train = (train_labels_str == '-1')
-        train_labels_for_fit = train_labels_str.loc[~ignore_mask_train]
-        le.fit(train_labels_for_fit)
-        encoded_labels_train = pd.Series(le.transform(train_labels_for_fit), 
-                                         index=train_labels_for_fit.index)
-        # 拟合训练集
-        new_train_labels = pd.Series(-1, index=train_df.index, dtype=np.int64)
-        new_train_labels.loc[~ignore_mask_train] = encoded_labels_train.values
-        train_df[col] = new_train_labels.astype(int)
-
-        # 转换 val/test
-        for name, df in [("Val", val_df), ("Test", test_df)]:
-            df_labels_str = df[col].astype(str).copy()
-            # 找到要忽略的标签
-            ignore_mask_df = (df_labels_str == '-1')
+        le.fit(valid_labels)
+        num_classes_dict[col] = len(le.classes_)
+        
+        # 2. 安全转换各个数据集
+        for df in [train_df, val_df, test_df]:
+            # 先存下原始列的字符串形式
+            temp_str_col = df[col].astype(str).str.strip()
             
-            # 找到需要转换的有效标签
-            df_labels_to_transform = df_labels_str.loc[~ignore_mask_df]
-            new_df_labels = pd.Series(-1, index=df.index,dtype=np.int64)
-            try:
-                encoded_labels_df = pd.Series(le.transform(df_labels_to_transform), 
-                                             index=df_labels_to_transform.index)
-                new_df_labels.loc[~ignore_mask_df] = encoded_labels_df
-            except ValueError as e:
-                # 如果遇到训练集未见过的标签，则进行映射
-                logger.warning(f"{name} set contains unseen labels in '{col}': {e}. Mapping unknown to -1.")
-                label_to_idx = {label: idx for idx, label in enumerate(le.classes_)}
-                mapped_labels = df_labels_to_transform.map(label_to_idx).fillna(-1).astype(int)
-                new_df_labels.loc[~ignore_mask_df] = mapped_labels
-            df[col] = new_df_labels.astype(int)
+            # 创建结果向量，初始化为 -1
+            result = np.full(len(df), -1, dtype=np.int64)
+            
+            # 找到在编码器中的已知标签
+            known_mask = temp_str_col.isin(le.classes_)
+            
+            # 只对已知的行进行转换
+            if known_mask.any():
+                # 这种赋值方式在 Pandas 中是基于位置/对齐的，非常安全
+                result[known_mask] = le.transform(temp_str_col[known_mask])
+            
+            # 覆盖原列（确保只修改当前 label 列，绝对不碰 IMAGE_PATH_COLUMN）
+            df[col] = result
 
-        label_encoders[col] = le
-        # 类别数是 fit_transform 之后 le.classes_ 的长度
-        num_classes_dict[col] = len(le.classes_) 
-        logger.info(f"任务 '{col}': 类别 {list(le.classes_)} → 编码 [0..{len(le.classes_)-1}], 共 {len(le.classes_)} 类")
-
-        # --- 少数类反转逻辑 ---
+        # 3. 少数类反转逻辑 (仅针对二分类)
         if num_classes_dict[col] == 2:
-            encoded_labels = train_df[col].loc[train_df[col] != -1]
-            if len(np.unique(encoded_labels)) < 2:
-                 logger.warning(f"任务 '{col}' 的有效训练样本中少于 2 个类别，跳过少数类反转。")
-            else:
-                counts = encoded_labels.value_counts()
-                
-                if len(counts) == 2:
-                    minority_encoded_value = counts.idxmin() # 频率最小的编码值
-                    
-                    if minority_encoded_value == 0:
-                        logger.warning(f"任务 '{col}' 的少数类被编码为 0。正在反转标签 0 <-> 1...")
-                        mapping = {0: 1, 1: 0}
-                        
-                        for df in [train_df, val_df, test_df]:
-                            # 仅对 0 和 1 进行映射，-1 保持不变
-                            df[col] = df[col].replace(mapping)
-                    else:
-                        logger.info(f"任务 '{col}' 的少数类已被正确编码为 1。无需反转。")
-        # --- 少数类反转逻辑结束 ---
+            counts = train_df[train_df[col] != -1][col].value_counts()
+            if len(counts) == 2 and counts.idxmin() == 0:
+                logger.warning(f"任务 '{col}' 少数类为 0，执行反转")
+                for df in [train_df, val_df, test_df]:
+                    df[col] = df[col].map({0: 1, 1: 0, -1: -1})
+
     return train_df, val_df, test_df, num_classes_dict

@@ -1,10 +1,10 @@
 import pandas as pd
 
-excel_path = '/home/yyi/data/data_pretrain/原发转移骨肿瘤_匹配合并结果.xlsx'
-output_csv = '/home/yyi/data/data_pretrain/bone_cancer.csv'
+excel_path = '/home/yyi/data/data_pretrain/原发转移骨肿瘤汇总带标签简洁.xlsx'
+output_csv = '/home/yyi/data/data_pretrain/原发转移骨肿瘤汇总带标签简洁.csv'
 
 # ✅ 指定哪些列要强制转为整数（缺失值替换为 -1）
-int_columns = ['原发/转移', '影像号','原发良性1/中间型2/恶性3']  # ← 请根据你的实际列名调整
+int_columns = ['x线条码号', '影像号']  # ← 请根据你的实际列名调整
 
 df = pd.read_excel(excel_path)
 

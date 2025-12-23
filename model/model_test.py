@@ -30,26 +30,26 @@ from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluat
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
 BATCH_SIZE = 256
-LEARNING_RATE = 0.1
+LEARNING_RATE = 0.01
 NUM_EPOCHS = 100
-PATIENCE = 30 # 早停耐心值
-RANDOM_SEED = 42 # 42, 100, 600, 1000, 2025
+PATIENCE = 10 # 早停耐心值
+RANDOM_SEED = 42 # 42, 100, 601, 1030, 2025
 
 # 自动选择 GPU 设备，优先使用 cuda:0
-DEVICE = "cuda:7"
+DEVICE = "cuda:3"
 
 # 用户提供的文件路径
-TRAIN_NAME = f"FracAtlas"
-CSV_PATH = "/home/yyi/data/test_dataset/FracAtlas_dataset.csv" # 标签CSV文件路径
+TRAIN_NAME = f"BTXRD"
+CSV_PATH = "/home/yyi/data/test_dataset/BTXRD_dataset.csv" # 标签CSV文件路径
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
-LABEL_COLUMNS = ['Fractured']  # 您的所有标签列名
+LABEL_COLUMNS = ['tumor','benign','malignant']  # 您的所有标签列名
 LOAD_LOCAL_CHECKPOINT = True # 是否加载本地检查点
 if LOAD_LOCAL_CHECKPOINT:
-    TEST_NAME = "boneDinov3_103499"
+    TEST_NAME = "xrayDinov3"
 else:
     TEST_NAME = "Dinov3"
 TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
-LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_165999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
+LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_186999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 
 # **新增：日志配置函数**
 LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
@@ -111,7 +111,7 @@ class MultiTaskImageDatasetFromDataFrame(Dataset):
 
         if self.transform:
             image = self.transform(image)
-        inputs = self.processor(images=image, size=self.size, return_tensors="pt")
+        inputs = self.processor(images=image, size={"height": self.size, "width": self.size}, return_tensors="pt")
         pixel_values = inputs["pixel_values"].squeeze(0)
 
         labels_dict = {}
@@ -250,7 +250,9 @@ def train_multi_task_classifier(logger: logging.Logger):
     if LOAD_LOCAL_CHECKPOINT:
         processor.image_mean = [0.351, 0.35, 0.351]
         processor.image_std = [0.297, 0.298, 0.298]
+        processor.do_center_crop = False
         logger.info(f"图像处理参数已修改: Mean={processor.image_mean}, Std={processor.image_std}")
+        logger.info(f"图像处理已关闭CenterCrop")
     # --- TENSORBOARD 初始化 ---
     writer = SummaryWriter(log_dir=LOG_DIR)
     logger.info(f"TensorBoard Writer initialized at: {LOG_DIR}")

@@ -96,8 +96,8 @@ def extract_dicom_metadata_to_csv(input_csv, output_csv, failed_csv=None, path_c
 # 使用示例
 # ==============================
 if __name__ == "__main__":
-    INPUT_CSV = "/home/yyi/data/6yuan_raw_dataset.csv"     # 输入路径列表
-    OUTPUT_CSV = "/home/yyi/data/6yuan_raw_count.csv"   # 输出带标签结果
+    INPUT_CSV = "/home/yyi/data/data_pretrain/isCancer.csv"     # 输入路径列表
+    OUTPUT_CSV = "/home/yyi/data/data_pretrain/isCancer_part.csv"   # 输出带标签结果
     FAILED_CSV = "/home/yyi/data/6yuan_raw_failed_paths.csv"         # 新增：失败路径记录（可选）
 
     stats = extract_dicom_metadata_to_csv(

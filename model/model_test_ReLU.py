@@ -23,33 +23,33 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 # ================================导入工具函数====================================
-from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict
+from utils.utils import set_seed, convert_dinov3_teacher_to_hf_state_dict, preprocess_labels_and_setup_datasets
 from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluate
  
 # --- 配置参数 ---
-MODEL_NAME = "facebook/dinov2-base" 
-TARGET_IMAGE_SIZE = 256 # 图像目标尺寸
+MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+TARGET_IMAGE_SIZE = 1024 # 图像目标尺寸
 BATCH_SIZE = 256
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.0005
 NUM_EPOCHS = 100
-PATIENCE = 30 # 早停耐心值
-RANDOM_SEED = 42 # 42, 100, 600, 1000, 2025
+PATIENCE = 10 # 早停耐心值
+RANDOM_SEED = 2025 # 42, 100, 600, 1000, 2025
 
 # 自动选择 GPU 设备，优先使用 cuda:0
-DEVICE = "cuda:7"
+DEVICE = "cuda:1"
 
 # 用户提供的文件路径
-TRAIN_NAME = "BoneCancer_benign"
-TRAIN_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_train.csv"
-VAL_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_val.csv"
-TEST_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_test.csv"
+TRAIN_NAME = f"MURA"
+CSV_PATH = "/home/yyi/data/test_dataset/MURA_label.csv" # 标签CSV文件路径
 IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
 LABEL_COLUMNS = ['label']  # 您的所有标签列名
 LOAD_LOCAL_CHECKPOINT = True # 是否加载本地检查点
-TEST_NAME = "RadDino"
+if LOAD_LOCAL_CHECKPOINT:
+    TEST_NAME = "xrayDinov3_ReLU"
+else:
+    TEST_NAME = "Dinov3_ReLU"
 TEST_NAME = f"{TEST_NAME}_{TRAIN_NAME}_{TARGET_IMAGE_SIZE}_{LEARNING_RATE}_{RANDOM_SEED}"
-LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/weight/rad_dino.pth" # 替换为您的本地 .pth 文件路径
-IGNORE_INDEX = -1
+LOCAL_CHECKPOINT_PATH = "/data/truenas_B2/yyi/bone_logs_512/eval/training_236999/teacher_checkpoint.pth" # 替换为您的本地 .pth 文件路径
 
 # **新增：日志配置函数**
 LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
@@ -216,7 +216,11 @@ class DinoV3MultiTaskClassifier(nn.Module):
             else:
                 logger.warning(f"警告：任务 '{task_name}' 的类别数 {num_classes} 无效。设置为 1。")
                 output_dim = 1
-            self.classifiers[task_name] = nn.Linear(feature_dim, output_dim)
+            self.classifiers[task_name] = nn.Sequential(
+                nn.Linear(feature_dim, 512),
+                nn.ReLU(),
+                nn.Linear(512, output_dim)
+            )
             # 确保分类头参数是可训练的
             for param in self.classifiers[task_name].parameters():
                  param.requires_grad = True
@@ -257,68 +261,37 @@ def train_multi_task_classifier(logger: logging.Logger):
     best_model_path = os.path.join(LOG_DIR, "best_model.pth")
 
     # 读取数据集
-    train_df = pd.read_csv(TRAIN_CSV_PATH)
-    val_df = pd.read_csv(VAL_CSV_PATH)
-    test_df = pd.read_csv(TEST_CSV_PATH)
-    for df in [train_df, val_df, test_df]:
-        df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-    logger.info(f"数据集已加载 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    total_df = pd.read_csv(CSV_PATH)
+    total_df.dropna(subset=[IMAGE_PATH_COLUMN], inplace=True)
+    logger.info(f"总数据集（去除无效路径后）: {len(total_df)}")
+    total_df = total_df.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+    train_val_df, test_df = train_test_split(
+        total_df, test_size=0.2, stratify=total_df[LABEL_COLUMNS[0]], random_state=RANDOM_SEED
+    )
+    train_df, val_df = train_test_split(
+        train_val_df, test_size=0.25, stratify=train_val_df[LABEL_COLUMNS[0]], random_state=RANDOM_SEED
+    )
+    logger.info(f"划分完成 -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
     label_encoders = {}
     num_classes_dict = {}
 
     for col in LABEL_COLUMNS:
         le = LabelEncoder()
-        train_labels_str = train_df[col].astype(str).copy()
-        ignore_mask_train = (train_labels_str == '-1')
-        train_labels_for_fit = train_labels_str.loc[~ignore_mask_train]
-        le.fit(train_labels_for_fit)
-        encoded_labels_train = pd.Series(le.transform(train_labels_for_fit), 
-                                         index=train_labels_for_fit.index)
         # 拟合训练集
-        new_train_labels = pd.Series(-1, index=train_df.index, dtype=np.int64)
-        new_train_labels.loc[~ignore_mask_train] = encoded_labels_train.values
-        
-        train_df[col] = new_train_labels.astype(int)
+        train_labels_str = train_df[col].astype(str)
+        train_df[col] = le.fit_transform(train_labels_str)
 
         # 转换 val/test
-        # --- 2. 转换 val/test ---
         for name, df in [("Val", val_df), ("Test", test_df)]:
-            df_labels_str = df[col].astype(str).copy()
-            # 找到要忽略的标签
-            ignore_mask_df = (df_labels_str == '-1')
-            
-            # 找到需要转换的有效标签
-            df_labels_to_transform = df_labels_str.loc[~ignore_mask_df]
-            new_df_labels = pd.Series(-1, index=df.index,dtype=np.int64)
-
             try:
-                # 转换有效标签
-                encoded_labels_df = pd.Series(le.transform(df_labels_to_transform), 
-                                             index=df_labels_to_transform.index)
-                
-                # 将编码后的有效标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = encoded_labels_df 
-
+                df[col] = le.transform(df[col].astype(str))
             except ValueError as e:
-                # 这段代码用于处理 Val/Test 集中出现了训练集 le.classes_ 中没有的**新**类别
                 logger.warning(f"{name} set contains unseen labels in '{col}': {e}. Mapping unknown to -1.")
-                
+                # 构建映射字典，未知设为 -1
                 label_to_idx = {label: idx for idx, label in enumerate(le.classes_)}
-                
-                # 对有效标签进行映射，如果遇到新类别则映射为 -1
-                mapped_labels = df_labels_to_transform.map(label_to_idx).fillna(-1).astype(int)
-                
-                # 将映射后的标签赋值回正确的位置
-                new_df_labels.loc[~ignore_mask_df] = mapped_labels 
-
-            # 最后将处理好的 Series 赋回 DataFrame
-            df[col] = new_df_labels.astype(int)
+                df[col] = df[col].astype(str).map(label_to_idx).fillna(-1).astype(int)
 
         label_encoders[col] = le
-        # 类别数只包含有效标签
         num_classes_dict[col] = len(le.classes_)
         logger.info(f"任务 '{col}': 类别 {list(le.classes_)} → 编码 [0..{len(le.classes_)-1}], 共 {len(le.classes_)} 类")
 
@@ -417,12 +390,12 @@ def train_multi_task_classifier(logger: logging.Logger):
             criterion_dict[task] = nn.BCEWithLogitsLoss(pos_weight=pos_weight_scalar)
             
         elif num_cls > 2:
-            criterion_dict[task] = nn.CrossEntropyLoss(weight=weight, ignore_index=IGNORE_INDEX)
+            criterion_dict[task] = nn.CrossEntropyLoss(weight=weight)
             logger.info(f"任务 '{task}' 的 CrossEntropyLoss 使用 class weights: {weight.cpu().numpy()}")
             
         else:
-            logger.error(f"任务 '{task}' 的类别数 {num_cls} 无效。使用默认 CrossEntropyLoss。")
-            criterion_dict[task] = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+            logger.error(f"任务 '{task}' 的类别数 {num_cls} 无效。使用默认 BCEWithLogitsLoss。")
+            criterion_dict[task] = nn.BCEWithLogitsLoss()
     
     # 仅优化分类头参数 (假设主干网络冻结)
     optimizer = torch.optim.AdamW(model.classifiers.parameters(), lr=LEARNING_RATE)
@@ -475,36 +448,20 @@ def train_multi_task_classifier(logger: logging.Logger):
                     logits = predictions_dict[task_name]  # shape: (batch_size, 1)
                     labels = labels_dict[task_name]   
                     num_cls = num_classes_dict[task_name]         # shape: (batch_size)
+
+                    # 1. 损失计算
                     task_criterion = criterion_dict[task_name]
-                    task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
                     if num_cls == 2:
-                        valid_mask = (labels != -1)
-                        valid_count = valid_mask.sum()
-                        if valid_count > 0:
-                            # 过滤 logits 和 labels
-                            valid_logits = logits[valid_mask]
-                            valid_labels = labels[valid_mask]
-                            
-                            # BCEWithLogitsLoss 需要浮点型的 target，形状为 (N, 1)
-                            target = valid_labels.float().view(-1, 1) 
-                            
-                            task_loss = task_criterion(valid_logits, target)
-                        else:
-                             # 如果批次中没有有效样本，损失为 0
-                            task_loss = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
-                        # 计算全部样本的概率 (用于指标统计)
+                        target = labels.float().view(-1, 1) 
                         probs_pos = torch.sigmoid(logits).squeeze(1) # [N]
-                        # 重新构造 [1-p, p] 格式的概率，用于 metrics
                         probabilities = torch.stack([1 - probs_pos, probs_pos], dim=1) # [N, 2]
-                        # 计算预测值 (0 或 1)
                         preds = (logits.squeeze(1) > 0).long()
                     else:
                         target = labels.long() 
-                        task_loss = task_criterion(logits, target)
                         probabilities = torch.softmax(logits, dim=1) 
-                        # 计算预测值
                         preds = torch.argmax(logits, dim=1)
 
+                    task_loss = task_criterion(logits, target)
                     combined_loss += task_loss # 累加总损失
                     train_probs_all[task_name].extend(probabilities.cpu().tolist())
                     train_labels_all[task_name].extend(labels.cpu().tolist())
@@ -555,7 +512,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             logger
         )
         key_task = model.task_names[0]
-        val_score = val_metrics[key_task]['auprc']
+        val_score = val_metrics[key_task]['auroc']
         # === 新增：学习率调度器步进 ===
         scheduler.step(val_score) 
         current_lr = optimizer.param_groups[0]['lr']
@@ -564,7 +521,7 @@ def train_multi_task_classifier(logger: logging.Logger):
             best_val_score = val_score
             patience_counter = 0
             best_epoch = epoch + 1
-            logger.info(f"最佳模型auprc分数: {best_val_score:.4f}")
+            logger.info(f"最佳模型auroc分数: {best_val_score:.4f}")
             try:
                 torch.save({
                     'epoch': best_epoch,

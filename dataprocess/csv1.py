@@ -1,31 +1,62 @@
 import os
 import pandas as pd
+import logging
+from pathlib import Path
 
-# 支持的图像扩展名（可根据需要添加）
-IMAGE_EXTENSIONS = {'.png'}
+# 配置日志（符合你的偏好）
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def create_image_csv(image_folder, output_csv):
-    # 用于保存图像路径的列表
-    image_path = []
+def find_dicom_files(root_dir: str) -> list:
+    """遍历目录，查找 DICOM 文件（.dcm 或无扩展名）"""
+    dicom_paths = []
+    root = Path(root_dir)
 
-    # 遍历文件夹及其子文件夹
-    for root, _, files in os.walk(image_folder):
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext in IMAGE_EXTENSIONS:
-                full_path = os.path.join(root, file)
-                image_path.append(full_path)
+    if not root.exists():
+        logging.error(f"根目录不存在: {root_dir}")
+        return []
 
-    # 创建 DataFrame 并写入 CSV
-    df = pd.DataFrame(image_path, columns=['image_path'])
-    df.to_csv(output_csv, index=False)
+    for file_path in root.rglob('*'):
+        if file_path.is_file() and not file_path.name.startswith('.'):
+            # 判断是否为 DICOM 文件
+            if file_path.suffix.lower() == '.dcm' or file_path.suffix == '':
+                dicom_paths.append(str(file_path.resolve()))
+    logging.info(f"共找到 {len(dicom_paths)} 个 DICOM 文件")
+    return dicom_paths
 
-    print(f"✅ 已生成 CSV 文件: {output_csv}")
-    print(f"总共找到图像数量: {len(image_path)}")
+def extract_two_labels(file_path: str):
+    """从路径提取倒数第二级目录 和 文件名（无扩展）"""
+    p = Path(file_path)
+    parts = p.parts  # 所有路径组件
 
-# 示例调用
-if __name__ == '__main__':
-    image_folder = '/data/truenas_B2/Dataset/001_6yXray/bone_dataset/MURA-v1.1'     # 替换为你的图像文件夹路径
-    output_csv = '/home/yyi/data/MURA.csv'  # 替换为你想保存的CSV路径
+    if len(parts) < 2:
+        # 路径太短，无法提取两级
+        return "", os.path.splitext(p.name)[0]
 
-    create_image_csv(image_folder, output_csv)
+    label_dir = parts[-2]      # 倒数第二级目录
+    label_file = p.stem        # 文件名（不含扩展名）
+    return label_dir, label_file
+
+def generate_csv_with_two_labels(dicom_paths: list, output_csv: str):
+    records = []
+    for path in dicom_paths:
+        label_dir, label_file = extract_two_labels(path)
+        records.append({
+            'DICOM文件': path,
+            'label_dir': label_dir,    # 倒数第二级目录
+            'label_file': label_file   # 文件名（无扩展）
+        })
+
+    df = pd.DataFrame(records)
+    df.to_csv(output_csv, index=False, encoding='utf-8')
+    logging.info(f"CSV 已保存至: {output_csv}")
+
+# ===== 主程序 =====
+if __name__ == "__main__":
+    root_folder = "/data/dataserver02/public/data/004_XrayFM"
+    output_csv_path = "/home/yyi/dicom_paths_with_label.csv"
+
+    dicom_files = find_dicom_files(root_folder)
+    if dicom_files:
+        generate_csv_with_two_labels(dicom_files, output_csv_path)
+    else:
+        logging.warning("未找到任何 DICOM 文件")

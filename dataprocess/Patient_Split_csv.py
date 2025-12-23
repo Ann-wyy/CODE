@@ -2,40 +2,42 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 # ==================== 配置 ====================
-input_csv = '/home/yyi/data/data_pretrain/bone_cancer.csv'
-output_train = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_train.csv'
-output_val = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_val.csv'
-output_test = '/home/yyi/data/test_dataset/BoneCancer/bone_cancer_test.csv'  # ← 新增
-
 train_ratio = 0.6
 val_ratio = 0.2
 test_ratio = 0.2
-random_state = 42
+random_state = 2025
+input_csv = '/home/yyi/data/data_pretrain/isCancer_part.csv'
+output_path = '/home/yyi/data/test_dataset/isCancer'
+output_name = 'isCancer'
+
+output_train = f'{output_path}/{output_name}_{random_state}_train.csv'
+output_val = f'{output_path}/{output_name}_{random_state}_val.csv'
+output_test = f'{output_path}/{output_name}_{random_state}_test.csv'
+
+
 
 # 是否启用分层划分？
 use_stratify = True
 
 # 指定用于分层的列（必须是标签列之一）
-stratify_column = '原发/转移'  # ← 只用于分层，但不会影响保存哪些列
+stratify_column = '标签'  # ← 只用于分层，但不会影响保存哪些列
 patient_id_col = '影像号'
 
-# 所有你想保存的列（包括图像路径 + 所有标签列）
+# 所有你想保存的列（包括图像路径 + 所有标签列）)
 # 格式：{'原始列名': '输出列名'}
+["image_path", "标签","年龄","性别","BodyPart"]
 output_columns = {
-    'image_path': 'image_path',
-    '原发/转移': '原发/转移',
-    '原发良性1/中间型2/恶性3': '良恶性',
+    'image_path': 'image_path' ,
+    '性别' : '性别',
+    '年龄' : 'age',
+    'BodyPart' : 'BodyPart',
+    '标签' : 'label'
 }
 
 # ==================================================
 
 # 1. 读取数据
 df = pd.read_csv(input_csv, encoding='utf-8-sig')
-
-# 必需的基础列
-required_cols = ['image_path', '影像号']
-if not all(col in df.columns for col in required_cols):
-    raise ValueError(f"CSV 必须包含列: {required_cols}")
 
 # 检查 output_columns 中的所有原始列是否存在
 missing_cols = [col for col in output_columns.keys() if col not in df.columns]

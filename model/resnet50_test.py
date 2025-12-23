@@ -22,32 +22,30 @@ from utils.metrics import calculate_metrics, log_metrics_to_tensorboard, evaluat
 
 # --- 1. 配置和超参数 (修改此处!) ---
 class Config:
-    TRAIN_CSV = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_train.csv"
-    VAL_CSV = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_val.csv"
-    TEST_CSV = "/home/yyi/data/test_dataset/BoneCancer/bone_cancer_test.csv"
+    TRAIN_NAME = "BoneCancer_benign"
+    TRAIN_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_train.csv"
+    VAL_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_val.csv"
+    TEST_CSV_PATH = "/home/yyi/data/test_dataset/cancer_benign/CancerBenign_42_test.csv"
     IMAGE_PATH_COLUMN = 'image_path' # CSV中包含图像相对路径的列名
-    LABEL_COLUMNS = ['原发/转移','良恶性']  # 您的所有标签列名
+    LABEL_COLUMNS = ['label']  # 您的所有标签列名
+    patience = 10
     
     # *** 关键：定义您的所有分类任务及其类别数 ***
     # 假设您的 CSV 中有 'tumor_type', 'aggressiveness', 'calcium_score' 三列作为标签
     TASK_CONFIG = {
-        '原发/转移': 2,  # 2 类别二分类
-        '良恶性': 3    # 3 类别多分类
+        'label': 2,  # 3 类别多分类
     }
-    
-    # 训练参数
     BATCH_SIZE = 32
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 0.0001
     NUM_EPOCHS = 80
     IMAGE_SIZE = 224
     DEVICE = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
 
 cfg = Config()
 
-RANDOM_SEED = 42
-TRAIN_NAME = f"bonecancer"
-TEST_NAME = f"{TRAIN_NAME}_ResNet50_{cfg.IMAGE_SIZE}_{cfg.LEARNING_RATE}_{RANDOM_SEED}"
-LOG_DIR = f"/data/truenas_B2/yyi/logs/{TRAIN_NAME}/{TEST_NAME}"
+RANDOM_SEED = 2025
+TEST_NAME = f"ResNet50_{cfg.TRAIN_NAME}_{cfg.IMAGE_SIZE}_{cfg.LEARNING_RATE}_{RANDOM_SEED}"
+LOG_DIR = f"/data/truenas_B2/yyi/logs/{cfg.TRAIN_NAME}/{TEST_NAME}"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILENAME = os.path.join(LOG_DIR, f"{TEST_NAME}_{time.strftime('%Y%m%d-%H%M%S')}.log")
 # 设置日志
@@ -137,7 +135,6 @@ class MultiTaskResNet(nn.Module):
 # --- 5. 训练和评估循环 (多任务适应) ---
 
 def train_one_epoch(model, dataloader, criteria, optimizer, device, task_config):
-    
 
     model.train()
     total_loss = 0.0
@@ -200,7 +197,7 @@ if __name__ == '__main__':
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_df, val_df, test_df, final_num_classes_dict = preprocess_labels_and_setup_datasets(cfg.TRAIN_CSV, cfg.VAL_CSV, cfg.TEST_CSV, cfg.LABEL_COLUMNS, cfg.IMAGE_PATH_COLUMN, logger)
+    train_df, val_df, test_df, final_num_classes_dict = preprocess_labels_and_setup_datasets(cfg.TRAIN_CSV_PATH, cfg.VAL_CSV_PATH, cfg.TEST_CSV_PATH, cfg.LABEL_COLUMNS, cfg.IMAGE_PATH_COLUMN, logger)
     cfg.TASK_CONFIG = final_num_classes_dict
 
     train_dataset = MultiTaskImageDataset(train_df, cfg.TASK_CONFIG,cfg.IMAGE_PATH_COLUMN, train_transforms)
@@ -231,12 +228,15 @@ if __name__ == '__main__':
     logger.info(f"开始在 {cfg.DEVICE} 上训练...")
     best_main_task_acc = 0.0 # 可以选择一个主要任务来保存最佳模型
     main_task_name = list(cfg.TASK_CONFIG.keys())[0]
+    early_stop_counter = 0
+    best_main_task_auroc = 0.0
 
     for epoch in range(cfg.NUM_EPOCHS):
         # 训练
-        logger.info(f"\n======== Epoch {epoch+1}/{cfg.NUM_EPOCHS} ========")
-        logger.info(f"训练总损失: {train_loss:.4f}")
+        logger.info(f"======== Epoch {epoch+1}/{cfg.NUM_EPOCHS} ========")
+        
         train_loss = train_one_epoch(model, train_loader, criteria, optimizer, cfg.DEVICE, cfg.TASK_CONFIG)
+        logger.info(f"训练总损失: {train_loss:.4f}")
         
         # 验证
         val_metrics = evaluate(model=model, data_loader=val_loader, criterion_dict=criteria, task_names=list(cfg.TASK_CONFIG.keys()), 
@@ -244,24 +244,24 @@ if __name__ == '__main__':
         
         # 使用第一个任务（如 'tumor_type'）的准确率来保存模型
         if main_task_name in val_metrics:
-            current_acc = val_metrics[main_task_name].get('auroc', 0.0)
-            if current_acc > best_main_task_acc:
-                best_main_task_acc = current_acc
-                torch.save(model.state_dict(), best_model_path)
-                logger.info(">>> 改进, 保存模型.-------------------------------------------------------------------------------------------")
-
+            current_auroc = val_metrics[main_task_name].get('auroc', 0.0)
+            if current_auroc > best_main_task_auroc:
+                best_main_task_auroc = current_auroc
+                early_stop_counter = 0  # 重置计数器
+                torch.save(model.state_dict(), best_model_path) # 保存当前最强模型
+                logger.info(f">>> 改进！当前最高 AUROC: {best_main_task_auroc:.4f}. 模型已保存。")
+            else:
+                early_stop_counter += 1
+                logger.info(f">>> 未改进。早停计数器: {early_stop_counter}/{cfg.patience}")
+            
+            # 3. 检查是否达到耐心值上限
+            if early_stop_counter >= cfg.patience:
+                logger.info(f"!!! 早停触发：连续 {cfg.patience} 个 Epoch 指标未提升。训练提前结束。")
+                break
     logger.info(f"训练完成. 最佳 {main_task_name} AUROC: {best_main_task_acc:.4f}")
 
     # 最终测试和性能报告
     logger.info("\n--- 开始最终测试集评估 ---")
-    model.load_state_dict(torch.load('best_multitask_resnet_model.pth'))
+    model.eval()
     test_metrics = evaluate(model=model, data_loader=test_loader, criterion_dict=criteria, 
         task_names=list(cfg.TASK_CONFIG.keys()), num_classes_dict=cfg.TASK_CONFIG, device=cfg.DEVICE, mode='Test', logger=logger)
-
-    for task_name, metrics in test_metrics.items():
-        logger.info(f"\n--- 任务: {task_name.upper()} 最终指标 ---")
-        for key, value in metrics.items():
-            if key in ['accuracy', 'precision', 'recall', 'f1', 'auroc', 'auprc']:
-                logger.info(f"{key.upper()}: {value*100:.2f}%")
-            else:
-                logger.info(f"{key.upper()}: {value}")

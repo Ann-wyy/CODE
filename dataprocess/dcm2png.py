@@ -5,11 +5,11 @@ import cv2
 import numpy as np
 
 # ==================== 配置 ====================
-csv_path = '/home/yyi/data/data_pretrain/bone_cancer.csv'
+csv_path = '/home/yyi/data/data_pretrain/bonecancer_backup.csv'
 png_root = '/data/truenas_B2/yyi/data/6y_bone_cancer'  # 已有 PNG 的根目录（也会在这里生成新 PNG）
 dicom_col = 'DICOM文件'
 patient_id_col = '影像号'
-png_col = 'PNG路径'
+png_col = 'image_path'
 
 # ==================================================
 
@@ -18,7 +18,7 @@ def extract_barcode_and_filebase(dicom_path):
     parts = os.path.normpath(dicom_path).split(os.sep)
     if len(parts) < 2:
         raise ValueError(f"路径太短: {dicom_path}")
-    barcode = parts[-2]
+    barcode = parts[-3]
     file_base = os.path.splitext(parts[-1])[0]
     return barcode, file_base
 
@@ -84,7 +84,7 @@ for idx, row in df.iterrows():
         continue
 
     dicom_path = str(dicom_path).strip()
-    patient_id = str(int(float(patient_id)))  # 确保是整数字符串（如 123 而非 123.0）
+    patient_id = str(patient_id).strip()  # 确保是整数字符串（如 123 而非 123.0）
 
     # 提取 barcode 和 file_base
     try:

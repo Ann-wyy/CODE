@@ -1,10 +1,10 @@
 import pandas as pd
 
 # 1. 读取 CSV 文件
-df = pd.read_csv('/home/yyi/data/bonecancer_png.csv')  # 替换为你的文件路径
+df = pd.read_csv('/home/yyi/data/data_pretrain/原发转移骨肿瘤_匹配合并结果_含部位_0.csv')  # 替换为你的文件路径
 
 # 2. 指定要统计的列名（例如 '诊断结果'）
-column_name = '病理结果'  # ←←← 请根据你的实际列名修改这里！
+column_name = '原发骨肿瘤病理结果'  # ←←← 请根据你的实际列名修改这里！
 
 # 3. 检查该列是否存在
 if column_name not in df.columns:
